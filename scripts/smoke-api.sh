@@ -17,6 +17,9 @@ done
 test -s /tmp/open-observability-health.json
 grep -q '"ok"' /tmp/open-observability-health.json
 cat /tmp/open-observability-health.json
+metrics_response="$(curl -fsS http://127.0.0.1:8080/metrics)"
+echo "$metrics_response" | grep -q 'observability_api_up 1'
+echo "$metrics_response" | grep -q 'observability_observations_ingested_total'
 model_response="$(curl -fsS -X POST http://127.0.0.1:8080/v1/model/complete \
   -H 'content-type: application/json' \
   -d '{"tenant_id":"00000000-0000-4000-8000-000000000010","model":"local-deterministic","prompt":"smoke model","evidence_ids":[]}')"

@@ -13,6 +13,16 @@ paths:
       security: []
       responses:
         '200': { description: OK }
+  /metrics:
+    get:
+      summary: Prometheus-compatible runtime and request metrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: { type: string }
   /v1/observations:
     post:
       summary: Ingest an observation

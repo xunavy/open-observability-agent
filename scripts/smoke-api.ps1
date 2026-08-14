@@ -16,6 +16,8 @@ $observation = @{
 } | ConvertTo-Json -Depth 5
 
 Invoke-RestMethod "$apiUrl/health" | Out-Null
+$metrics = Invoke-WebRequest "$apiUrl/metrics" | Select-Object -ExpandProperty Content
+if ($metrics -notmatch 'observability_api_up 1') { throw 'metrics endpoint is not healthy' }
 Invoke-RestMethod "$apiUrl/v1/observations" -Method Post -ContentType 'application/json' -Body $observation | Out-Null
 $query = Invoke-RestMethod "$apiUrl/v1/observations?tenant_id=$tenant&page=1&page_size=10"
 if ($query.Count -lt 1) { throw 'observation query returned no rows' }
