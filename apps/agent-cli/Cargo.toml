@@ -1,0 +1,11 @@
+[package]
+name = "observability-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+observability-core = { path = "../../crates/observability-core" }
+reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

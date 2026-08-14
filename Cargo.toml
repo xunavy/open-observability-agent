@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/observability-core", "crates/observability-sqlite", "apps/observability-api", "apps/agent-cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
