@@ -67,6 +67,8 @@ cargo run -p observability-api
 
 容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查和 workspace 测试。
 
+本地容器启动：复制 `.env.example` 为 `.env` 后运行 `docker compose up --build`；API 使用 SQLite volume 持久化并提供 `/health` 健康检查。
+
 API 契约见 [docs/openapi.yaml](docs/openapi.yaml)。
 
 生产验收边界见 [docs/production-readiness.md](docs/production-readiness.md)。

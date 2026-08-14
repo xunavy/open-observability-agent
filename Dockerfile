@@ -1,4 +1,4 @@
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -14,4 +14,3 @@ USER app
 ENV OBSERVABILITY_DATA=/app/data/observations.jsonl
 EXPOSE 8080
 CMD ["/usr/local/bin/observability-api"]
-

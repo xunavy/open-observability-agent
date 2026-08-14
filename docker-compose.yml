@@ -1,0 +1,22 @@
+services:
+  observability-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      OBSERVABILITY_STORAGE: sqlite
+      OBSERVABILITY_SQLITE_DATA: /app/data/observability.sqlite
+    volumes:
+      - observability-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  observability-data:
