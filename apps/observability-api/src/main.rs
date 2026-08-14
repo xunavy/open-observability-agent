@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, RwLock},
 };
 use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -33,6 +33,9 @@ struct AppState {
     usage_store: Arc<dyn UsageRepository>,
     usage: Arc<RwLock<UsageLedger>>,
     batch_slots: Arc<Semaphore>,
+    observations_ingested: Arc<AtomicU64>,
+    model_calls: Arc<AtomicU64>,
+    agent_executions: Arc<AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +99,7 @@ async fn ingest(
         .observations
         .append(&observation)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.observations_ingested.fetch_add(1, Ordering::Relaxed);
     Ok((StatusCode::CREATED, Json(observation)))
 }
 
@@ -135,6 +139,9 @@ async fn ingest_batch(
             .append(observation)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
+    state
+        .observations_ingested
+        .fetch_add(batch.observations.len() as u64, Ordering::Relaxed);
     Ok((StatusCode::CREATED, Json(batch.observations.len())))
 }
 
@@ -185,6 +192,7 @@ async fn agent_execute(
     Json(request): Json<ToolExecutionRequest>,
 ) -> Result<Json<ToolExecutionResult>, (StatusCode, String)> {
     enforce_tenant(&request.tenant_id.0)?;
+    state.agent_executions.fetch_add(1, Ordering::Relaxed);
     let items = state
         .observations
         .list()
@@ -197,6 +205,7 @@ async fn model_complete(
     Json(request): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     enforce_tenant(&request.tenant_id.0)?;
+    state.model_calls.fetch_add(1, Ordering::Relaxed);
     let provider = DeterministicModelProvider;
     let response = provider
         .complete(&request)
@@ -305,10 +314,15 @@ async fn health() -> Json<HashMap<&'static str, &'static str>> {
     Json(HashMap::from([("status", "ok")]))
 }
 
-async fn metrics() -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+async fn metrics(
+    State(state): State<AppState>,
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
     let storage = std::env::var("OBSERVABILITY_STORAGE").unwrap_or_else(|_| "jsonl".into());
     let body = format!(
-        "# HELP observability_api_info Runtime configuration of the API.\n# TYPE observability_api_info gauge\nobservability_api_info{{storage=\"{storage}\"}} 1\n# HELP observability_api_up Whether the API process is serving requests.\n# TYPE observability_api_up gauge\nobservability_api_up 1\n"
+        "# HELP observability_api_info Runtime configuration of the API.\n# TYPE observability_api_info gauge\nobservability_api_info{{storage=\"{storage}\"}} 1\n# HELP observability_api_up Whether the API process is serving requests.\n# TYPE observability_api_up gauge\nobservability_api_up 1\n# HELP observability_observations_ingested_total Observations accepted by the API.\n# TYPE observability_observations_ingested_total counter\nobservability_observations_ingested_total {}\n# HELP observability_model_calls_total Model completion requests accepted by the API.\n# TYPE observability_model_calls_total counter\nobservability_model_calls_total {}\n# HELP observability_agent_executions_total Agent tool executions accepted by the API.\n# TYPE observability_agent_executions_total counter\nobservability_agent_executions_total {}\n",
+        state.observations_ingested.load(Ordering::Relaxed),
+        state.model_calls.load(Ordering::Relaxed),
+        state.agent_executions.load(Ordering::Relaxed)
     );
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
@@ -396,6 +410,9 @@ async fn main() {
             usage_store,
             usage: Arc::new(RwLock::new(usage_ledger)),
             batch_slots: Arc::new(Semaphore::new(8)),
+            observations_ingested: Arc::new(AtomicU64::new(0)),
+            model_calls: Arc::new(AtomicU64::new(0)),
+            agent_executions: Arc::new(AtomicU64::new(0)),
         });
     let address: SocketAddr = "0.0.0.0:8080".parse().expect("valid listen address");
     let listener = tokio::net::TcpListener::bind(address)
