@@ -305,6 +305,14 @@ async fn health() -> Json<HashMap<&'static str, &'static str>> {
     Json(HashMap::from([("status", "ok")]))
 }
 
+async fn metrics() -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    let storage = std::env::var("OBSERVABILITY_STORAGE").unwrap_or_else(|_| "jsonl".into());
+    let body = format!(
+        "# HELP observability_api_info Runtime configuration of the API.\n# TYPE observability_api_info gauge\nobservability_api_info{{storage=\"{storage}\"}} 1\n# HELP observability_api_up Whether the API process is serving requests.\n# TYPE observability_api_up gauge\nobservability_api_up 1\n"
+    );
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
 async fn api_key_guard(request: Request<Body>, next: Next) -> Result<Response, StatusCode> {
     let configured = std::env::var("OBSERVABILITY_API_KEY").ok();
     if std::env::var("OBSERVABILITY_ENV").as_deref() == Ok("production")
@@ -372,6 +380,7 @@ async fn main() {
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/observations", post(ingest).get(list))
         .route("/v1/observations/batch", post(ingest_batch))
         .route("/v1/diagnostics", post(diagnostics))

@@ -55,6 +55,8 @@ cargo run -p observability-api
 
 服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。控制台原型位于 `apps/console/index.html`，可部署到静态托管服务后，将 API 地址接入前端。
 
+API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；当前指标为服务存活和存储模式基础指标，业务指标仍在后续接入中。
+
 生产环境请设置 `OBSERVABILITY_API_KEY`，客户端使用 `X-API-Key` 请求头；本地开发可以不设置。
 
 用量账本默认写入 `data/usage.jsonl`，可通过 `OBSERVABILITY_USAGE_DATA` 指定路径；API 启动时会恢复已有账本。
