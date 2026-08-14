@@ -200,6 +200,23 @@ async fn agent_execute(
     Ok(Json(execute_safe_tool(&request, &items)))
 }
 
+fn parse_model_response(
+    body: serde_json::Value,
+    model: &str,
+) -> Result<observability_core::ModelResponse, String> {
+    let text = body["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "provider response missing choices[0].message.content".to_string())?;
+    Ok(observability_core::ModelResponse {
+        model: model.to_owned(),
+        text: text.to_owned(),
+        input_tokens: body["usage"]["prompt_tokens"].as_u64().unwrap_or_default(),
+        output_tokens: body["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+    })
+}
+
 async fn model_complete(
     State(state): State<AppState>,
     Json(request): Json<ModelRequest>,
@@ -235,22 +252,7 @@ async fn model_complete(
             .json()
             .await
             .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
-        let text = body["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "provider response missing choices[0].message.content".into(),
-                )
-            })?;
-        observability_core::ModelResponse {
-            model: request.model.clone(),
-            text: text.to_owned(),
-            input_tokens: body["usage"]["prompt_tokens"].as_u64().unwrap_or_default(),
-            output_tokens: body["usage"]["completion_tokens"]
-                .as_u64()
-                .unwrap_or_default(),
-        }
+        parse_model_response(body, &request.model).map_err(|error| (StatusCode::BAD_GATEWAY, error))?
     } else {
         DeterministicModelProvider
             .complete(&request)
@@ -513,5 +515,28 @@ mod tests {
     fn batch_limit_is_explicit() {
         assert_eq!(MAX_BATCH_SIZE, 1_000);
         assert!(MAX_BATCH_SIZE < 10_000);
+    }
+
+    #[test]
+    fn parses_openai_compatible_model_response_and_usage() {
+        let response = parse_model_response(
+            serde_json::json!({
+                "choices": [{"message": {"content": "root cause found"}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+            }),
+            "example-model",
+        )
+        .unwrap();
+        assert_eq!(response.model, "example-model");
+        assert_eq!(response.text, "root cause found");
+        assert_eq!(response.input_tokens, 12);
+        assert_eq!(response.output_tokens, 7);
+    }
+
+    #[test]
+    fn rejects_model_response_without_message_content() {
+        let error = parse_model_response(serde_json::json!({"choices": []}), "example-model")
+            .unwrap_err();
+        assert!(error.contains("message.content"));
     }
 }
