@@ -206,10 +206,56 @@ async fn model_complete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     enforce_tenant(&request.tenant_id.0)?;
     state.model_calls.fetch_add(1, Ordering::Relaxed);
-    let provider = DeterministicModelProvider;
-    let response = provider
-        .complete(&request)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let response = if let Some(endpoint) = std::env::var("MODEL_PROVIDER_URL").ok() {
+        let key = std::env::var("MODEL_API_KEY").map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MODEL_API_KEY is required when MODEL_PROVIDER_URL is configured".into(),
+            )
+        })?;
+        let client = reqwest::Client::new();
+        let provider_response = client
+            .post(endpoint)
+            .bearer_auth(key)
+            .json(&serde_json::json!({
+                "model": &request.model,
+                "messages": [{"role": "user", "content": &request.prompt}],
+                "metadata": {"evidence_ids": &request.evidence_ids}
+            }))
+            .send()
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+        if !provider_response.status().is_success() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("model provider returned {}", provider_response.status()),
+            ));
+        }
+        let body: serde_json::Value = provider_response
+            .json()
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+        let text = body["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "provider response missing choices[0].message.content".into(),
+                )
+            })?;
+        observability_core::ModelResponse {
+            model: request.model.clone(),
+            text: text.to_owned(),
+            input_tokens: body["usage"]["prompt_tokens"].as_u64().unwrap_or_default(),
+            output_tokens: body["usage"]["completion_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        }
+    } else {
+        DeterministicModelProvider
+            .complete(&request)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?
+    };
     let observation = model_observation(&request, &response, &request.model, 0, 0);
     state
         .observations

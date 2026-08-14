@@ -14,6 +14,7 @@
 
 - `DeterministicModelProvider`：本地可测试，无网络依赖。
 - `OpenAiCompatibleProvider`：CLI 中的 HTTP 适配器，支持显式 endpoint 和 API key 环境变量。
+- API 服务端也支持通过 `MODEL_PROVIDER_URL` + `MODEL_API_KEY` 启用 OpenAI-compatible completion；未配置 endpoint 时使用 deterministic provider，配置 endpoint 但缺失 key 或上游失败会明确返回错误。
 
 生产适配器要求：
 
@@ -25,4 +26,3 @@
 6. provider API key 只能来自 secret manager 或运行时环境。
 
 真实 provider 联调需要用户提供 endpoint、凭据和数据处理授权；当前仓库只对适配器编译和本地 provider 进行验证。
-
