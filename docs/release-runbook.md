@@ -9,6 +9,7 @@ The local repository contains a clean `main` branch and the annotated `v0.1.0` t
 ```
 
 The script refuses to publish a dirty worktree or overwrite an existing `origin` remote.
+After the tag is pushed, `.github/workflows/release.yml` creates a GitHub Release and generates release notes automatically.
 
 ## Cloud deployment
 
