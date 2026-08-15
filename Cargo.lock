@@ -493,6 +493,7 @@ dependencies = [
  "axum",
  "observability-core",
  "observability-sqlite",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
