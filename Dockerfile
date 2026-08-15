@@ -6,7 +6,10 @@ COPY apps/observability-api ./apps/observability-api
 RUN cargo build --release -p observability-api
 
 FROM debian:bookworm-slim
-RUN useradd --create-home --uid 10001 app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 app
 WORKDIR /app
 COPY --from=builder /src/target/release/observability-api /usr/local/bin/observability-api
 RUN mkdir -p /app/data && chown -R app:app /app
