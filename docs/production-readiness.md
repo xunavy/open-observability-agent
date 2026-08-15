@@ -20,6 +20,7 @@
 - API key 不是完整身份系统；生产需要组织、项目、RBAC、密钥轮换和审计。
 - CORS 当前为 permissive 原型配置，生产必须使用 allowlist。
 - 已增加 `OBSERVABILITY_TENANT_ID` 单租户运行时边界；不匹配的请求返回 403，但这仍不是多租户 RBAC。
+- 已增加 `OBSERVABILITY_API_KEYS` 的 tenant-to-secret 映射模式；请求必须同时提供 `X-API-Key` 与 `X-Tenant-ID`，业务 body/query tenant 也会再次校验。该模式仍缺少持久化密钥轮换和组织 RBAC。
 - Agent 当前是确定性规则规划器，尚未接入模型 provider、token 预算、提示词版本和模型成本记录。
 - 尚未完成支付商 webhook、订阅状态同步、退款和税务边界。
 - 尚未完成 Cloudflare/Vercel 的真实部署与域名、密钥、日志验证。

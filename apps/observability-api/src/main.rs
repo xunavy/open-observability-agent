@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::{header::HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -19,13 +19,19 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{atomic::{AtomicU64, Ordering}, Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 const MAX_BATCH_SIZE: usize = 1_000;
+
+#[derive(Clone, Default)]
+struct AuthorizedTenant(Option<Uuid>);
 
 #[derive(Clone)]
 struct AppState {
@@ -87,11 +93,23 @@ fn enforce_tenant(tenant_id: &Uuid) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+fn enforce_tenant_for(
+    authorized: &AuthorizedTenant,
+    tenant_id: &Uuid,
+) -> Result<(), (StatusCode, String)> {
+    enforce_tenant(tenant_id)?;
+    if authorized.0.is_some_and(|expected| expected != *tenant_id) {
+        return Err((StatusCode::FORBIDDEN, "tenant is not authorized".into()));
+    }
+    Ok(())
+}
+
 async fn ingest(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(observation): Json<Observation>,
 ) -> Result<(StatusCode, Json<Observation>), (StatusCode, String)> {
-    enforce_tenant(&observation.tenant_id.0)?;
+    enforce_tenant_for(&authorized, &observation.tenant_id.0)?;
     observation
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -105,10 +123,11 @@ async fn ingest(
 
 async fn ingest_batch(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(batch): Json<ObservationBatch>,
 ) -> Result<(StatusCode, Json<usize>), (StatusCode, String)> {
     for observation in &batch.observations {
-        enforce_tenant(&observation.tenant_id.0)?;
+        enforce_tenant_for(&authorized, &observation.tenant_id.0)?;
     }
     let _slot = state.batch_slots.clone().try_acquire_owned().map_err(|_| {
         (
@@ -147,9 +166,10 @@ async fn ingest_batch(
 
 async fn list(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Query(query): Query<TenantQuery>,
 ) -> Result<Json<Vec<Observation>>, (StatusCode, String)> {
-    enforce_tenant(&query.tenant_id)?;
+    enforce_tenant_for(&authorized, &query.tenant_id)?;
     let items = state
         .observations
         .list()
@@ -159,9 +179,10 @@ async fn list(
 
 async fn diagnostics(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(query): Json<TenantQuery>,
 ) -> Result<Json<Vec<Finding>>, (StatusCode, String)> {
-    enforce_tenant(&query.tenant_id)?;
+    enforce_tenant_for(&authorized, &query.tenant_id)?;
     let items = state
         .observations
         .list()
@@ -171,9 +192,10 @@ async fn diagnostics(
 
 async fn agent_plan(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(request): Json<AgentRequest>,
 ) -> Result<Json<AgentDecision>, (StatusCode, String)> {
-    enforce_tenant(&request.tenant_id.0)?;
+    enforce_tenant_for(&authorized, &request.tenant_id.0)?;
     if request.objective.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -189,9 +211,10 @@ async fn agent_plan(
 
 async fn agent_execute(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(request): Json<ToolExecutionRequest>,
 ) -> Result<Json<ToolExecutionResult>, (StatusCode, String)> {
-    enforce_tenant(&request.tenant_id.0)?;
+    enforce_tenant_for(&authorized, &request.tenant_id.0)?;
     state.agent_executions.fetch_add(1, Ordering::Relaxed);
     let items = state
         .observations
@@ -219,9 +242,10 @@ fn parse_model_response(
 
 async fn model_complete(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(request): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    enforce_tenant(&request.tenant_id.0)?;
+    enforce_tenant_for(&authorized, &request.tenant_id.0)?;
     state.model_calls.fetch_add(1, Ordering::Relaxed);
     let response = if let Some(endpoint) = std::env::var("MODEL_PROVIDER_URL").ok() {
         let key = std::env::var("MODEL_API_KEY").map_err(|_| {
@@ -252,7 +276,8 @@ async fn model_complete(
             .json()
             .await
             .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
-        parse_model_response(body, &request.model).map_err(|error| (StatusCode::BAD_GATEWAY, error))?
+        parse_model_response(body, &request.model)
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?
     } else {
         DeterministicModelProvider
             .complete(&request)
@@ -290,9 +315,10 @@ async fn model_complete(
 
 async fn record_usage(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(entry): Json<UsageEntry>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    enforce_tenant(&entry.tenant_id.0)?;
+    enforce_tenant_for(&authorized, &entry.tenant_id.0)?;
     state
         .usage_store
         .append(&entry)
@@ -312,9 +338,10 @@ async fn record_usage(
 
 async fn usage(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageEntry>>, (StatusCode, String)> {
-    enforce_tenant(&query.tenant_id)?;
+    enforce_tenant_for(&authorized, &query.tenant_id)?;
     let ledger = state.usage.read().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -341,9 +368,10 @@ struct BillingRequest {
 
 async fn billing_quote(
     State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
     Json(request): Json<BillingRequest>,
 ) -> Result<Json<BillingQuote>, (StatusCode, String)> {
-    enforce_tenant(&request.tenant_id)?;
+    enforce_tenant_for(&authorized, &request.tenant_id)?;
     let ledger = state.usage.read().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -372,23 +400,58 @@ async fn metrics(
         state.model_calls.load(Ordering::Relaxed),
         state.agent_executions.load(Ordering::Relaxed)
     );
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
 }
 
 async fn api_key_guard(request: Request<Body>, next: Next) -> Result<Response, StatusCode> {
+    let mut request = request;
+    let authorized_tenant = if let Some(mapping) = std::env::var("OBSERVABILITY_API_KEYS").ok() {
+        let supplied_key = request
+            .headers()
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok());
+        let supplied_tenant = request
+            .headers()
+            .get("x-tenant-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let matched = mapping.split(',').find_map(|entry| {
+            let (tenant, secret) = entry.split_once('=')?;
+            let tenant = Uuid::parse_str(tenant.trim()).ok()?;
+            (supplied_key == Some(secret.trim()) && supplied_tenant == Some(tenant))
+                .then_some(tenant)
+        });
+        let Some(tenant) = matched else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        Some(tenant)
+    } else {
+        None
+    };
+    request
+        .extensions_mut()
+        .insert(AuthorizedTenant(authorized_tenant));
     let configured = std::env::var("OBSERVABILITY_API_KEY").ok();
     if std::env::var("OBSERVABILITY_ENV").as_deref() == Ok("production")
         && configured.as_deref().is_none_or(str::is_empty)
     {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    if let Some(expected) = configured {
-        let supplied = request
-            .headers()
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok());
-        if supplied != Some(expected.as_str()) {
-            return Err(StatusCode::UNAUTHORIZED);
+    if authorized_tenant.is_none() {
+        if let Some(expected) = configured {
+            let supplied = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok());
+            if supplied != Some(expected.as_str()) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
     }
     Ok(next.run(request).await)
@@ -535,8 +598,20 @@ mod tests {
 
     #[test]
     fn rejects_model_response_without_message_content() {
-        let error = parse_model_response(serde_json::json!({"choices": []}), "example-model")
-            .unwrap_err();
+        let error =
+            parse_model_response(serde_json::json!({"choices": []}), "example-model").unwrap_err();
         assert!(error.contains("message.content"));
+    }
+
+    #[test]
+    fn tenant_scoped_key_cannot_use_another_tenant() {
+        let authorized = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let scope = AuthorizedTenant(Some(authorized));
+        assert!(enforce_tenant_for(&scope, &authorized).is_ok());
+        assert_eq!(
+            enforce_tenant_for(&scope, &other).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
     }
 }
