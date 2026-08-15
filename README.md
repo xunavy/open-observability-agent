@@ -1,5 +1,7 @@
 # Open Observability Agent
 
+开源仓库：[github.com/xunavy/open-observability-agent](https://github.com/xunavy/open-observability-agent)
+
 一个以 Rust 为核心、面向 Agent 与工作流的开源可观测智能系统。目标是把“运行数据 → 可解释诊断 → Agent 执行 → 结果验证”做成可运营的多租户服务。
 
 项目采用 Apache-2.0 许可证，欢迎通过 GitHub Issue/PR 参与。当前代码是早期开发版本，不应直接接收生产敏感数据。
