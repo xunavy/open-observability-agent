@@ -14,6 +14,7 @@ After the tag is pushed, `.github/workflows/release.yml` creates a GitHub Releas
 ## Cloud deployment
 
 - Vercel: deploy `apps/console` as a static project and configure its API base URL.
+- Vercel automation: add repository secrets `VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID`; `.github/workflows/vercel-console.yml` then deploys the console on console changes or manual dispatch. Without those secrets it records a skip instead of failing the repository CI.
 - Cloudflare: place an API Gateway/Worker or Pages frontend in front of the Rust API; keep SQLite single-instance only and use a production database for multiple replicas.
 - Set `OBSERVABILITY_ENV=production`, `OBSERVABILITY_API_KEY`, `OBSERVABILITY_CORS_ORIGINS`, and provider secrets through the platform secret manager.
 - Verify `/health`, `/metrics`, API-key rejection, tenant isolation, model completion, and persistence after deployment.
