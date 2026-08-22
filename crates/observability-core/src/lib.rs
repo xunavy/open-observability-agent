@@ -129,9 +129,9 @@ impl BoundedObservationQueue {
         }
     }
 
-    pub fn try_push(&mut self, observation: Observation) -> Result<(), Observation> {
+    pub fn try_push(&mut self, observation: Observation) -> Result<(), Box<Observation>> {
         if self.items.len() >= self.capacity {
-            return Err(observation);
+            return Err(Box::new(observation));
         }
         self.items.push_back(observation);
         Ok(())
