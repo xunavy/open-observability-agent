@@ -21,6 +21,12 @@ API 支持 `OBSERVABILITY_STORAGE=sqlite` 启用 SQLite 单实例 backend；它�
 
 `GET /health` 保持公开以供容器编排健康检查；其他 API 在配置密钥后受认证保护。
 
+## OTLP trace 接入
+
+Rust API 按 [OTLP 1.11.0](https://opentelemetry.io/docs/specs/otlp/) 的 HTTP trace 路径，在 `POST /v1/traces` 接受 protobuf 与 JSON 编码的 `ExportTraceServiceRequest`。OpenTelemetry SDK 或 Collector 的 endpoint 可设置为 `http://api-host:8080`，并通过 exporter headers 发送 `x-tenant-id=<UUID>` 和 `x-api-key=<secret>`。API 会把 resource、instrumentation scope 和 span attributes 保留到 Observation，并把 GenAI/Agent/Tool/HTTP 语义分类到现有领域模型。
+
+当前每个请求最多 4 MiB / 1000 spans；非法 span 使用 OTLP `partial_success` 报告。标准要求的 gzip request body 尚未实现，发送非 `identity` 的 `Content-Encoding` 会返回 `415`，因此这仍是 OTLP/HTTP 的早期兼容实现。
+
 ## 控制台
 
 `apps/console` 是零构建依赖的静态控制台，可部署到 Vercel 或 Cloudflare Pages。它直接读取 Rust API，覆盖观测筛选、诊断发现、持久队列、死信重放、Agent evidence 计划、usage 和 billing quote；没有连接或 API 返回空集时显示明确的空状态，不生成演示数据。

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Open Observability Agent API
-  version: 0.2.0
+  version: 0.3.0
   description: Multi-tenant observability and evidence-backed agent operations API.
 servers:
   - url: http://localhost:8080
@@ -22,6 +22,31 @@ paths:
           content:
             text/plain:
               schema: { type: string }
+  /v1/traces:
+    post:
+      summary: Ingest an OTLP ExportTraceServiceRequest
+      description: Maps valid OTLP spans to tenant observations. The response uses the request encoding and reports invalid spans through OTLP partial_success.
+      parameters:
+        - { name: X-Tenant-ID, in: header, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema: { type: string, format: binary }
+          application/json:
+            schema: { type: object, description: OTLP JSON-encoded ExportTraceServiceRequest }
+      responses:
+        '200':
+          description: OTLP full or partial success
+          content:
+            application/x-protobuf:
+              schema: { type: string, format: binary }
+            application/json:
+              schema: { type: object, description: OTLP JSON-encoded ExportTraceServiceResponse }
+        '400': { description: Invalid tenant header or request envelope }
+        '413': { description: Body exceeds 4 MiB or request exceeds 1000 spans }
+        '415': { description: Unsupported content type or content encoding }
+        '429': { description: Ingestion concurrency slots are exhausted }
   /v1/observations:
     post:
       summary: Ingest an observation

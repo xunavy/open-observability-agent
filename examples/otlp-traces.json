@@ -1,0 +1,50 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "checkout-service" }
+          },
+          {
+            "key": "deployment.environment.name",
+            "value": { "stringValue": "smoke" }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "open-observability-smoke",
+            "version": "0.1.0"
+          },
+          "spans": [
+            {
+              "traceId": "01010101010101010101010101010101",
+              "spanId": "0202020202020202",
+              "name": "checkout-agent.invoke",
+              "kind": 1,
+              "startTimeUnixNano": "1787414400000000000",
+              "endTimeUnixNano": "1787414400328000000",
+              "attributes": [
+                {
+                  "key": "gen_ai.agent.name",
+                  "value": { "stringValue": "checkout-agent" }
+                },
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": { "stringValue": "invoke_agent" }
+                }
+              ],
+              "status": {
+                "message": "payment provider timeout",
+                "code": 2
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,23 +1,21 @@
 # Release runbook
 
-## GitHub
+## GitHub release
 
-The local repository contains a clean `main` branch and the annotated `v0.1.0` tag. After creating an empty GitHub repository, run from the repository root:
+1. 确认 `main` worktree 干净，`cargo fmt`、Clippy、workspace tests 和全部 smoke 通过。
+2. 更新 workspace version、`CHANGELOG.md` 与 OpenAPI version。
+3. 推送 `main`，等待 `quality` 和 `container` 两条 GitHub Actions 成功。
+4. 创建 annotated tag（例如 `git tag -a v0.3.0 -m "v0.3.0"`）并推送该 tag。
+5. `.github/workflows/release.yml` 会创建 GitHub Release；发布后核对 tag、commit 和生成的 release notes。
 
-```powershell
-.\scripts\publish-github.ps1 -RemoteUrl https://github.com/<owner>/<repo>.git
-```
-
-The script refuses to publish a dirty worktree or overwrite an existing `origin` remote.
-After the tag is pushed, `.github/workflows/release.yml` creates a GitHub Release and generates release notes automatically.
+`v0.1.0` 与 `v0.2.0` 已发布。任何新的 release 都必须指向已经通过远端质量门禁的 commit。
 
 ## Cloud deployment
 
-- Vercel: deploy `apps/console` as a static project and configure its API base URL.
-- Vercel automation: add repository secrets `VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID`; `.github/workflows/vercel-console.yml` then deploys the console on console changes or manual dispatch. Without those secrets it records a skip instead of failing the repository CI.
-- Cloudflare: place an API Gateway/Worker or Pages frontend in front of the Rust API; keep SQLite single-instance only and use a production database for multiple replicas.
-- Cloudflare Pages automation: add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_PAGES_PROJECT` repository secrets; `.github/workflows/cloudflare-pages.yml` deploys `apps/console` when configured.
-- Set `OBSERVABILITY_ENV=production`, `OBSERVABILITY_API_KEY`, `OBSERVABILITY_CORS_ORIGINS`, and provider secrets through the platform secret manager.
-- Verify `/health`, `/metrics`, API-key rejection, tenant isolation, model completion, and persistence after deployment.
+- Vercel: 将 `apps/console` 部署为静态项目；工作流需要 `VERCEL_TOKEN`、`VERCEL_ORG_ID` 和 `VERCEL_PROJECT_ID`。
+- Cloudflare Pages: 工作流需要 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID` 和 `CLOUDFLARE_PAGES_PROJECT`。
+- Rust API: 设置 `OBSERVABILITY_ENV=production`、tenant/global API keys、`OBSERVABILITY_CORS_ORIGINS` 和持久化存储配置。
+- OTLP exporter: endpoint 指向 API，headers 包含 `x-tenant-id` 和 `x-api-key`；当前不要启用 gzip request body。
+- 上线后验证 `/health`、`/metrics`、API-key 拒绝、tenant 隔离、OTLP trace、模型调用、持久化重启和控制台浏览器链路。
 
-No cloud deployment is claimed until the provider CLI reports a deployment URL and the smoke checks pass against that URL.
+Vercel/Cloudflare 工作流在 secrets 缺失时会成功结束但跳过 deploy step。只有 provider 返回部署 URL，且针对该 URL 的 smoke 通过后，才能宣称已经云部署。

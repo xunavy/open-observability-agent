@@ -18,3 +18,4 @@ jobs:
       - run: node --check apps/console/app.js
       - run: bash scripts/smoke-durable-queue.sh
       - run: bash scripts/smoke-tenant-auth.sh
+      - run: bash scripts/smoke-otlp.sh

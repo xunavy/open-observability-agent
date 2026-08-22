@@ -1,9 +1,9 @@
 use axum::{
-    body::Body,
-    extract::{Extension, Query, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Extension, Query, State},
     http::{
         header::{HeaderName, HeaderValue},
-        Method, Request, StatusCode,
+        HeaderMap, Method, Request, StatusCode,
     },
     middleware::{self, Next},
     response::Response,
@@ -33,7 +33,11 @@ use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
+mod otlp;
+
 const MAX_BATCH_SIZE: usize = 1_000;
+const MAX_OTLP_SPANS: usize = 1_000;
+const MAX_OTLP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 type StorageRuntime = (
     Arc<dyn ObservationRepository>,
@@ -66,6 +70,8 @@ struct AppState {
     queue_processed: Arc<AtomicU64>,
     queue_retries: Arc<AtomicU64>,
     queue_dead_letters: Arc<AtomicU64>,
+    otlp_spans_accepted: Arc<AtomicU64>,
+    otlp_spans_rejected: Arc<AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +232,133 @@ async fn ingest_batch(
     }
     let status = accept_observations(&state, &batch.observations)?;
     Ok((status, Json(batch.observations.len())))
+}
+
+fn otlp_rpc_code(status: StatusCode) -> i32 {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => 3,
+        StatusCode::UNAUTHORIZED => 16,
+        StatusCode::FORBIDDEN => 7,
+        StatusCode::NOT_FOUND => 5,
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => 8,
+        _ => 13,
+    }
+}
+
+fn otlp_response(status: StatusCode, encoding: otlp::OtlpEncoding, body: Vec<u8>) -> Response {
+    Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, encoding.content_type())
+        .body(Body::from(body))
+        .expect("valid OTLP response")
+}
+
+fn otlp_error_response(
+    status: StatusCode,
+    encoding: otlp::OtlpEncoding,
+    message: impl AsRef<str>,
+) -> Response {
+    let message = message.as_ref();
+    let body = otlp::encode_error(encoding, otlp_rpc_code(status), message)
+        .unwrap_or_else(|_| message.as_bytes().to_vec());
+    otlp_response(status, encoding, body)
+}
+
+fn otlp_tenant(headers: &HeaderMap) -> Result<Uuid, &'static str> {
+    headers
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or("x-tenant-id must contain a tenant UUID")
+}
+
+async fn ingest_otlp_traces(
+    State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let encoding = match otlp::OtlpEncoding::from_content_type(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(encoding) => encoding,
+        Err(error) => {
+            return otlp_error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                otlp::OtlpEncoding::Json,
+                error.to_string(),
+            )
+        }
+    };
+
+    if headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+    {
+        return otlp_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            encoding,
+            "compressed OTLP requests are not supported yet",
+        );
+    }
+
+    let tenant_id = match otlp_tenant(&headers) {
+        Ok(tenant_id) => tenant_id,
+        Err(message) => return otlp_error_response(StatusCode::BAD_REQUEST, encoding, message),
+    };
+    if let Err((status, message)) = enforce_tenant_for(&authorized, &tenant_id) {
+        return otlp_error_response(status, encoding, message);
+    }
+
+    let request = match otlp::decode_request(encoding, &body) {
+        Ok(request) => request,
+        Err(error) => {
+            return otlp_error_response(StatusCode::BAD_REQUEST, encoding, error.to_string())
+        }
+    };
+    let span_count = otlp::span_count(&request);
+    if span_count > MAX_OTLP_SPANS {
+        return otlp_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            encoding,
+            "OTLP request cannot contain more than 1000 spans",
+        );
+    }
+
+    let _slot = match state.batch_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => {
+            return otlp_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                encoding,
+                "OTLP ingestion is busy; retry later",
+            )
+        }
+    };
+    let mapped = otlp::map_request(request, TenantId(tenant_id));
+    if !mapped.observations.is_empty() {
+        if let Err((status, message)) = accept_observations(&state, &mapped.observations) {
+            return otlp_error_response(status, encoding, message);
+        }
+    }
+    state
+        .otlp_spans_accepted
+        .fetch_add(mapped.observations.len() as u64, Ordering::Relaxed);
+    state
+        .otlp_spans_rejected
+        .fetch_add(mapped.rejected_spans as u64, Ordering::Relaxed);
+
+    match otlp::encode_response(encoding, mapped.rejected_spans, mapped.error_message) {
+        Ok(body) => otlp_response(StatusCode::OK, encoding, body),
+        Err(error) => otlp_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            encoding,
+            error.to_string(),
+        ),
+    }
 }
 
 async fn list(
@@ -573,13 +706,15 @@ async fn metrics(
     let storage = std::env::var("OBSERVABILITY_STORAGE").unwrap_or_else(|_| "jsonl".into());
     let ingestion = std::env::var("OBSERVABILITY_INGEST_MODE").unwrap_or_else(|_| "direct".into());
     let body = format!(
-        "# HELP observability_api_info Runtime configuration of the API.\n# TYPE observability_api_info gauge\nobservability_api_info{{storage=\"{storage}\",ingestion=\"{ingestion}\"}} 1\n# HELP observability_api_up Whether the API process is serving requests.\n# TYPE observability_api_up gauge\nobservability_api_up 1\n# HELP observability_observations_ingested_total Observations accepted by the API.\n# TYPE observability_observations_ingested_total counter\nobservability_observations_ingested_total {}\n# HELP observability_model_calls_total Model completion requests accepted by the API.\n# TYPE observability_model_calls_total counter\nobservability_model_calls_total {}\n# HELP observability_agent_executions_total Agent tool executions accepted by the API.\n# TYPE observability_agent_executions_total counter\nobservability_agent_executions_total {}\n# HELP observability_queue_processed_total Durable queue items persisted to observation storage.\n# TYPE observability_queue_processed_total counter\nobservability_queue_processed_total {}\n# HELP observability_queue_retries_total Durable queue items scheduled for retry.\n# TYPE observability_queue_retries_total counter\nobservability_queue_retries_total {}\n# HELP observability_queue_dead_letters_total Durable queue items moved to dead letter.\n# TYPE observability_queue_dead_letters_total counter\nobservability_queue_dead_letters_total {}\n",
+        "# HELP observability_api_info Runtime configuration of the API.\n# TYPE observability_api_info gauge\nobservability_api_info{{storage=\"{storage}\",ingestion=\"{ingestion}\"}} 1\n# HELP observability_api_up Whether the API process is serving requests.\n# TYPE observability_api_up gauge\nobservability_api_up 1\n# HELP observability_observations_ingested_total Observations accepted by the API.\n# TYPE observability_observations_ingested_total counter\nobservability_observations_ingested_total {}\n# HELP observability_model_calls_total Model completion requests accepted by the API.\n# TYPE observability_model_calls_total counter\nobservability_model_calls_total {}\n# HELP observability_agent_executions_total Agent tool executions accepted by the API.\n# TYPE observability_agent_executions_total counter\nobservability_agent_executions_total {}\n# HELP observability_queue_processed_total Durable queue items persisted to observation storage.\n# TYPE observability_queue_processed_total counter\nobservability_queue_processed_total {}\n# HELP observability_queue_retries_total Durable queue items scheduled for retry.\n# TYPE observability_queue_retries_total counter\nobservability_queue_retries_total {}\n# HELP observability_queue_dead_letters_total Durable queue items moved to dead letter.\n# TYPE observability_queue_dead_letters_total counter\nobservability_queue_dead_letters_total {}\n# HELP observability_otlp_spans_accepted_total OTLP spans mapped to observations.\n# TYPE observability_otlp_spans_accepted_total counter\nobservability_otlp_spans_accepted_total {}\n# HELP observability_otlp_spans_rejected_total Invalid OTLP spans reported through partial success.\n# TYPE observability_otlp_spans_rejected_total counter\nobservability_otlp_spans_rejected_total {}\n",
         state.observations_ingested.load(Ordering::Relaxed),
         state.model_calls.load(Ordering::Relaxed),
         state.agent_executions.load(Ordering::Relaxed),
         state.queue_processed.load(Ordering::Relaxed),
         state.queue_retries.load(Ordering::Relaxed),
-        state.queue_dead_letters.load(Ordering::Relaxed)
+        state.queue_dead_letters.load(Ordering::Relaxed),
+        state.otlp_spans_accepted.load(Ordering::Relaxed),
+        state.otlp_spans_rejected.load(Ordering::Relaxed)
     );
     (
         [(
@@ -737,6 +872,8 @@ async fn main() {
         queue_processed: Arc::new(AtomicU64::new(0)),
         queue_retries: Arc::new(AtomicU64::new(0)),
         queue_dead_letters: Arc::new(AtomicU64::new(0)),
+        otlp_spans_accepted: Arc::new(AtomicU64::new(0)),
+        otlp_spans_rejected: Arc::new(AtomicU64::new(0)),
     };
     if state.queue.is_some() {
         tokio::spawn(run_queue_worker(state.clone()));
@@ -744,6 +881,10 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route(
+            "/v1/traces",
+            post(ingest_otlp_traces).layer(DefaultBodyLimit::max(MAX_OTLP_BODY_BYTES)),
+        )
         .route("/v1/observations", post(ingest).get(list))
         .route("/v1/observations/batch", post(ingest_batch))
         .route("/v1/diagnostics", post(diagnostics))
@@ -888,6 +1029,8 @@ mod tests {
             queue_processed: Arc::new(AtomicU64::new(0)),
             queue_retries: Arc::new(AtomicU64::new(0)),
             queue_dead_letters: Arc::new(AtomicU64::new(0)),
+            otlp_spans_accepted: Arc::new(AtomicU64::new(0)),
+            otlp_spans_rejected: Arc::new(AtomicU64::new(0)),
         };
 
         assert!(process_queue_once(&state).unwrap());
