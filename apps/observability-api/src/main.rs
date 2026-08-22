@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Extension, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{
         header::{HeaderName, HeaderValue},
         HeaderMap, Method, Request, StatusCode,
@@ -11,17 +11,20 @@ use axum::{
     Json, Router,
 };
 use observability_core::{
-    diagnose, execute_safe_tool, model_observation, plan_agent_request, quote_monthly_usage,
-    AgentDecision, AgentRequest, BillingQuote, DeterministicModelProvider, Finding,
-    JsonlObservationStore, JsonlUsageStore, ModelProvider, ModelRequest, Observation,
-    ObservationError, ObservationQueueItem, ObservationQueueRepository, ObservationQueueStats,
-    ObservationRepository, ObservationStatus, QueueDisposition, SubscriptionPlan, TenantId,
-    ToolExecutionRequest, ToolExecutionResult, UsageEntry, UsageKind, UsageLedger, UsageRepository,
+    diagnose, execute_safe_tool, inspect_failure_context, model_observation, plan_agent_request,
+    quote_monthly_usage, AgentDecision, AgentRequest, ApprovalPolicy, BillingQuote,
+    DeterministicModelProvider, Finding, InvestigationRepository, InvestigationRun,
+    InvestigationStatus, InvestigationStep, InvestigationStepStatus, JsonlObservationStore,
+    JsonlUsageStore, ModelProvider, ModelRequest, Observation, ObservationError, ObservationKind,
+    ObservationQueueItem, ObservationQueueRepository, ObservationQueueStats, ObservationRepository,
+    ObservationStatus, QueueDisposition, SafeTool, SubscriptionPlan, TenantId,
+    ToolExecutionRequest, ToolExecutionResult, UsageEntry, UsageEvent, UsageKind, UsageLedger,
+    UsageRepository,
 };
 use observability_sqlite::SqliteStore;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -38,12 +41,18 @@ mod otlp;
 const MAX_BATCH_SIZE: usize = 1_000;
 const MAX_OTLP_SPANS: usize = 1_000;
 const MAX_OTLP_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INVESTIGATION_EVIDENCE: usize = 100;
+const INVESTIGATION_INPUT_NAMESPACE: Uuid = Uuid::from_u128(0x694ed062_a850_44db_80bf_a0441845bf52);
+const INVESTIGATION_RESULT_NAMESPACE: Uuid =
+    Uuid::from_u128(0x97ad0c44_443d_4a3a_902d_7b8c47d65e6b);
+const INVESTIGATION_USAGE_NAMESPACE: Uuid = Uuid::from_u128(0x85bf94f3_776d_4cc7_a8c8_4a24f0eb5950);
 
 type StorageRuntime = (
     Arc<dyn ObservationRepository>,
     Arc<dyn UsageRepository>,
     UsageLedger,
     Option<Arc<dyn ObservationQueueRepository>>,
+    Option<Arc<dyn InvestigationRepository>>,
 );
 
 #[derive(Clone)]
@@ -63,6 +72,7 @@ struct AppState {
     queue: Option<QueueRuntime>,
     usage_store: Arc<dyn UsageRepository>,
     usage: Arc<RwLock<UsageLedger>>,
+    investigations: Option<Arc<dyn InvestigationRepository>>,
     batch_slots: Arc<Semaphore>,
     observations_ingested: Arc<AtomicU64>,
     model_calls: Arc<AtomicU64>,
@@ -100,12 +110,38 @@ struct DeadLetterReplayRequest {
     observation_id: Uuid,
 }
 
+#[derive(Deserialize)]
+struct CreateInvestigationRequest {
+    objective: String,
+    evidence_ids: Vec<Uuid>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+fn utc_period(timestamp_ms: i64) -> String {
+    let days = timestamp_ms.div_euclid(86_400_000);
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    }
+    .div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}")
 }
 
 fn retry_delay_ms(attempts: u32) -> i64 {
@@ -432,6 +468,256 @@ async fn agent_execute(
     Ok(Json(execute_safe_tool(&request, &items)))
 }
 
+fn configured_investigations(
+    state: &AppState,
+) -> Result<&Arc<dyn InvestigationRepository>, (StatusCode, String)> {
+    state.investigations.as_ref().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "investigations require OBSERVABILITY_STORAGE=sqlite".into(),
+        )
+    })
+}
+
+fn investigation_tenant(
+    authorized: &AuthorizedTenant,
+    headers: &HeaderMap,
+) -> Result<TenantId, (StatusCode, String)> {
+    if let Some(tenant_id) = authorized.0 {
+        return Ok(TenantId(tenant_id));
+    }
+    if std::env::var("OBSERVABILITY_ENV").as_deref() == Ok("production") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "investigations require a tenant-scoped API key".into(),
+        ));
+    }
+    otlp_tenant(headers)
+        .map(TenantId)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))
+}
+
+fn investigation_idempotency_key(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Idempotency-Key header is required".into(),
+            )
+        })?;
+    if key.len() > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key cannot exceed 128 bytes".into(),
+        ));
+    }
+    Ok(key)
+}
+
+fn validated_evidence_ids(
+    state: &AppState,
+    tenant_id: &TenantId,
+    ids: &[Uuid],
+    require_nonempty: bool,
+) -> Result<(Vec<Uuid>, Vec<Observation>), (StatusCode, String)> {
+    let ids = ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if require_nonempty && ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "at least one evidence ID is required".into(),
+        ));
+    }
+    if ids.len() > MAX_INVESTIGATION_EVIDENCE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "no more than 100 evidence IDs are allowed".into(),
+        ));
+    }
+    let evidence = state
+        .observations
+        .get_many(tenant_id, &ids)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if evidence.len() != ids.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "one or more evidence IDs are unavailable".into(),
+        ));
+    }
+    Ok((ids, evidence))
+}
+
+async fn create_investigation(
+    State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvestigationRequest>,
+) -> Result<(StatusCode, Json<InvestigationRun>), (StatusCode, String)> {
+    let repository = configured_investigations(&state)?;
+    let tenant_id = investigation_tenant(&authorized, &headers)?;
+    let idempotency_key = investigation_idempotency_key(&headers)?;
+    let objective = request.objective.trim();
+    if objective.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "objective must not be empty".into(),
+        ));
+    }
+    if objective.len() > 2_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "objective cannot exceed 2000 bytes".into(),
+        ));
+    }
+    let (evidence_ids, _) =
+        validated_evidence_ids(&state, &tenant_id, &request.evidence_ids, true)?;
+    let input = serde_json::to_vec(&(objective, &evidence_ids))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let now = now_ms();
+    let run = InvestigationRun {
+        id: Uuid::new_v4(),
+        tenant_id: tenant_id.clone(),
+        objective: objective.into(),
+        status: InvestigationStatus::Planned,
+        evidence_ids,
+        steps: vec![InvestigationStep {
+            id: Uuid::new_v4(),
+            tool: SafeTool::InspectFailureContext,
+            approval_policy: ApprovalPolicy::NotRequired,
+            status: InvestigationStepStatus::Planned,
+            input_hash: Uuid::new_v5(&INVESTIGATION_INPUT_NAMESPACE, &input).to_string(),
+            output_observation_id: None,
+            error: None,
+        }],
+        result_observation_id: None,
+        error: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+        version: 1,
+    };
+    let result = repository
+        .create_or_get(idempotency_key, &run)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if !result.created
+        && (result.run.objective != run.objective || result.run.evidence_ids != run.evidence_ids)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Idempotency-Key was already used with a different request".into(),
+        ));
+    }
+    Ok((
+        if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(result.run),
+    ))
+}
+
+async fn get_investigation(
+    State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InvestigationRun>, (StatusCode, String)> {
+    let tenant_id = investigation_tenant(&authorized, &headers)?;
+    configured_investigations(&state)?
+        .get(&tenant_id, &id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "investigation was not found".into()))
+}
+
+async fn execute_investigation(
+    State(state): State<AppState>,
+    Extension(authorized): Extension<AuthorizedTenant>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InvestigationRun>, (StatusCode, String)> {
+    let tenant_id = investigation_tenant(&authorized, &headers)?;
+    let repository = configured_investigations(&state)?;
+    let run = repository
+        .get(&tenant_id, &id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "investigation was not found".into()))?;
+    if run.status == InvestigationStatus::Completed {
+        return Ok(Json(run));
+    }
+    let (_, evidence) = validated_evidence_ids(&state, &tenant_id, &run.evidence_ids, true)?;
+    let summary = inspect_failure_context(&tenant_id, &run.evidence_ids, &evidence);
+    let step = run
+        .steps
+        .first()
+        .ok_or_else(|| (StatusCode::CONFLICT, "investigation step is missing".into()))?;
+    let now = now_ms();
+    let result_id = Uuid::new_v5(&INVESTIGATION_RESULT_NAMESPACE, run.id.as_bytes());
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "evidence_count".into(),
+        summary.total_observations.to_string(),
+    );
+    attributes.insert(
+        "failed_observations".into(),
+        summary.failed_observations.to_string(),
+    );
+    if let Some(name) = summary.slowest_observation_name {
+        attributes.insert("slowest_observation_name".into(), name);
+    }
+    if let Some(duration) = summary.slowest_duration_ms {
+        attributes.insert("slowest_duration_ms".into(), duration.to_string());
+    }
+    attributes.insert("summary".into(), summary.summary);
+    let result_observation = Observation {
+        id: result_id,
+        tenant_id: tenant_id.clone(),
+        trace_id: run.id.to_string(),
+        span_id: step.id.to_string(),
+        kind: ObservationKind::Tool,
+        name: "investigation.inspect_failure_context".into(),
+        status: ObservationStatus::Ok,
+        started_at_ms: now,
+        duration_ms: 0,
+        attributes,
+    };
+    let usage_event = UsageEvent {
+        event_id: Uuid::new_v5(&INVESTIGATION_USAGE_NAMESPACE, run.id.as_bytes()),
+        tenant_id: tenant_id.clone(),
+        occurred_at_ms: now,
+        period: utc_period(now),
+        kind: UsageKind::AgentRun,
+        quantity: 1,
+        source_type: "Investigation".into(),
+        source_id: run.id,
+    };
+    let completed = repository
+        .complete(&tenant_id, &run.id, &result_observation, &usage_event, now)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if completed.completed_now {
+        state.agent_executions.fetch_add(1, Ordering::Relaxed);
+        let ledger = state
+            .usage_store
+            .load()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        *state.usage.write().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "usage lock poisoned".into(),
+            )
+        })? = ledger;
+    }
+    Ok(Json(completed.run))
+}
+
 fn parse_model_response(
     body: serde_json::Value,
     model: &str,
@@ -455,6 +741,7 @@ async fn model_complete(
     Json(request): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     enforce_tenant_for(&authorized, &request.tenant_id.0)?;
+    validated_evidence_ids(&state, &request.tenant_id, &request.evidence_ids, false)?;
     state.model_calls.fetch_add(1, Ordering::Relaxed);
     let response = if let Ok(endpoint) = std::env::var("MODEL_PROVIDER_URL") {
         let key = std::env::var("MODEL_API_KEY").map_err(|_| {
@@ -496,7 +783,7 @@ async fn model_complete(
     accept_observations(&state, std::slice::from_ref(&observation))?;
     let usage = UsageEntry {
         tenant_id: request.tenant_id,
-        period: "current".into(),
+        period: utc_period(now_ms()),
         kind: UsageKind::ModelToken,
         quantity: response.input_tokens + response.output_tokens,
     };
@@ -525,6 +812,12 @@ async fn record_usage(
     Json(entry): Json<UsageEntry>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     enforce_tenant_for(&authorized, &entry.tenant_id.0)?;
+    if std::env::var("OBSERVABILITY_ENV").as_deref() == Ok("production") && authorized.0.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "usage events are service-managed".into(),
+        ));
+    }
     state
         .usage_store
         .append(&entry)
@@ -548,12 +841,10 @@ async fn usage(
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageEntry>>, (StatusCode, String)> {
     enforce_tenant_for(&authorized, &query.tenant_id)?;
-    let ledger = state.usage.read().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "usage lock poisoned".into(),
-        )
-    })?;
+    let ledger = state
+        .usage_store
+        .load()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(
         ledger.snapshot(&TenantId(query.tenant_id), &query.period),
     ))
@@ -578,12 +869,10 @@ async fn billing_quote(
     Json(request): Json<BillingRequest>,
 ) -> Result<Json<BillingQuote>, (StatusCode, String)> {
     enforce_tenant_for(&authorized, &request.tenant_id)?;
-    let ledger = state.usage.read().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "usage lock poisoned".into(),
-        )
-    })?;
+    let ledger = state
+        .usage_store
+        .load()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(quote_monthly_usage(
         &ledger,
         &TenantId(request.tenant_id),
@@ -754,43 +1043,35 @@ async fn api_key_guard(request: Request<Body>, next: Next) -> Result<Response, S
     {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    let authorized_tenant = if let Some(mapping) = mapping {
-        let supplied_key = request
-            .headers()
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok());
-        let supplied_tenant = request
-            .headers()
-            .get("x-tenant-id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| Uuid::parse_str(value).ok());
-        let matched = mapping.split(',').find_map(|entry| {
+    let supplied_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok());
+    let supplied_tenant = request
+        .headers()
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let authorized_tenant = mapping.as_deref().and_then(|mapping| {
+        mapping.split(',').find_map(|entry| {
             let (tenant, secret) = entry.split_once('=')?;
             let tenant = Uuid::parse_str(tenant.trim()).ok()?;
             (supplied_key == Some(secret.trim()) && supplied_tenant == Some(tenant))
                 .then_some(tenant)
-        });
-        let Some(tenant) = matched else {
-            return Err(StatusCode::UNAUTHORIZED);
-        };
-        Some(tenant)
-    } else {
-        None
-    };
+        })
+    });
+    let global_key_matches = configured
+        .as_deref()
+        .is_some_and(|expected| supplied_key == Some(expected));
+    if authorized_tenant.is_none()
+        && !global_key_matches
+        && (mapping.is_some() || configured.is_some())
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     request
         .extensions_mut()
         .insert(AuthorizedTenant(authorized_tenant));
-    if authorized_tenant.is_none() {
-        if let Some(expected) = configured {
-            let supplied = request
-                .headers()
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok());
-            if supplied != Some(expected.as_str()) {
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-        }
-    }
     Ok(next.run(request).await)
 }
 
@@ -808,6 +1089,7 @@ fn cors_layer() -> CorsLayer {
                     axum::http::header::CONTENT_TYPE,
                     HeaderName::from_static("x-api-key"),
                     HeaderName::from_static("x-tenant-id"),
+                    HeaderName::from_static("idempotency-key"),
                 ])
         }
         Err(_) => CorsLayer::permissive(),
@@ -835,7 +1117,7 @@ async fn main() {
     if let Some(parent) = std::path::Path::new(&usage_path).parent() {
         std::fs::create_dir_all(parent).expect("create usage directory");
     }
-    let (observations, usage_store, usage_ledger, queue_repository): StorageRuntime =
+    let (observations, usage_store, usage_ledger, queue_repository, investigations): StorageRuntime =
         if storage_kind == "sqlite" {
             let sqlite_path = std::env::var("OBSERVABILITY_SQLITE_DATA")
                 .unwrap_or_else(|_| "data/observability.sqlite".into());
@@ -846,13 +1128,15 @@ async fn main() {
             let ledger = UsageRepository::load(store.as_ref()).expect("load sqlite usage ledger");
             let queue: Option<Arc<dyn ObservationQueueRepository>> = (ingest_mode == "durable")
                 .then(|| store.clone() as Arc<dyn ObservationQueueRepository>);
-            (store.clone(), store, ledger, queue)
+            let investigations: Option<Arc<dyn InvestigationRepository>> =
+                Some(store.clone() as Arc<dyn InvestigationRepository>);
+            (store.clone(), store, ledger, queue, investigations)
         } else {
             let observation_store: Arc<dyn ObservationRepository> =
                 Arc::new(JsonlObservationStore::new(data_path));
             let usage_store: Arc<dyn UsageRepository> = Arc::new(JsonlUsageStore::new(usage_path));
             let ledger = UsageRepository::load(usage_store.as_ref()).expect("load usage ledger");
-            (observation_store, usage_store, ledger, None)
+            (observation_store, usage_store, ledger, None, None)
         };
     let queue = queue_repository.map(|repository| QueueRuntime {
         repository,
@@ -877,6 +1161,7 @@ async fn main() {
         queue,
         usage_store,
         usage: Arc::new(RwLock::new(usage_ledger)),
+        investigations,
         batch_slots: Arc::new(Semaphore::new(8)),
         observations_ingested: Arc::new(AtomicU64::new(0)),
         model_calls: Arc::new(AtomicU64::new(0)),
@@ -902,6 +1187,12 @@ async fn main() {
         .route("/v1/diagnostics", post(diagnostics))
         .route("/v1/agent/plan", post(agent_plan))
         .route("/v1/agent/execute", post(agent_execute))
+        .route("/v1/investigations", post(create_investigation))
+        .route("/v1/investigations/{id}", get(get_investigation))
+        .route(
+            "/v1/investigations/{id}/execute",
+            post(execute_investigation),
+        )
         .route("/v1/model/complete", post(model_complete))
         .route("/v1/usage", post(record_usage).get(usage))
         .route("/v1/billing/quote", post(billing_quote))
@@ -1011,6 +1302,13 @@ mod tests {
     }
 
     #[test]
+    fn usage_period_is_a_utc_calendar_month() {
+        assert_eq!(utc_period(0), "1970-01");
+        assert_eq!(utc_period(1_787_356_800_000), "2026-08");
+        assert_eq!(utc_period(-1), "1969-12");
+    }
+
+    #[test]
     fn queue_worker_persists_and_acknowledges_observation() {
         let store = Arc::new(SqliteStore::open(":memory:").unwrap());
         let tenant = Uuid::new_v4();
@@ -1034,6 +1332,7 @@ mod tests {
             }),
             usage_store: usage_repository,
             usage: Arc::new(RwLock::new(UsageLedger::default())),
+            investigations: Some(store.clone()),
             batch_slots: Arc::new(Semaphore::new(1)),
             observations_ingested: Arc::new(AtomicU64::new(0)),
             model_calls: Arc::new(AtomicU64::new(0)),

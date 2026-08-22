@@ -19,3 +19,4 @@ jobs:
       - run: bash scripts/smoke-durable-queue.sh
       - run: bash scripts/smoke-tenant-auth.sh
       - run: bash scripts/smoke-otlp.sh
+      - run: bash scripts/smoke-investigation.sh

@@ -1,7 +1,8 @@
 use observability_core::{
-    Observation, ObservationError, ObservationQueueItem, ObservationQueueRepository,
-    ObservationQueueStats, ObservationRepository, QueueDisposition, TenantId, UsageEntry,
-    UsageLedger, UsageRepository,
+    InvestigationCompletion, InvestigationCreateResult, InvestigationRepository, InvestigationRun,
+    InvestigationStatus, InvestigationStepStatus, Observation, ObservationError,
+    ObservationQueueItem, ObservationQueueRepository, ObservationQueueStats, ObservationRepository,
+    QueueDisposition, TenantId, UsageEntry, UsageEvent, UsageLedger, UsageRepository,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -29,8 +30,38 @@ impl SqliteStore {
                  last_error TEXT,
                  payload TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS investigation_runs (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 version INTEGER NOT NULL,
+                 payload TEXT NOT NULL,
+                 UNIQUE (tenant_id, idempotency_key)
+             );
+             CREATE TABLE IF NOT EXISTS investigation_steps (
+                 id TEXT PRIMARY KEY,
+                 run_id TEXT NOT NULL,
+                 tenant_id TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 payload TEXT NOT NULL,
+                 UNIQUE (run_id, id)
+             );
+             CREATE TABLE IF NOT EXISTS usage_events (
+                 event_id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL,
+                 occurred_at_ms INTEGER NOT NULL,
+                 period TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 quantity INTEGER NOT NULL,
+                 source_type TEXT NOT NULL,
+                 source_id TEXT NOT NULL,
+                 UNIQUE (tenant_id, source_type, source_id, kind)
+             );
              CREATE INDEX IF NOT EXISTS observation_queue_claim_idx ON observation_queue (state, available_at_ms, enqueued_at_ms);
-             CREATE INDEX IF NOT EXISTS observation_queue_tenant_idx ON observation_queue (tenant_id, state, enqueued_at_ms);",
+             CREATE INDEX IF NOT EXISTS observation_queue_tenant_idx ON observation_queue (tenant_id, state, enqueued_at_ms);
+             CREATE INDEX IF NOT EXISTS investigation_runs_tenant_idx ON investigation_runs (tenant_id, id);
+             CREATE INDEX IF NOT EXISTS investigation_steps_run_idx ON investigation_steps (tenant_id, run_id);",
         ).map_err(|e| ObservationError::Storage(e.to_string()))?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -346,6 +377,291 @@ impl ObservationRepository for SqliteStore {
         })
         .collect()
     }
+
+    fn get_many(
+        &self,
+        tenant_id: &TenantId,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<Observation>, ObservationError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ObservationError::Storage("sqlite lock poisoned".into()))?;
+        let mut statement = connection
+            .prepare("SELECT payload FROM observations WHERE tenant_id = ?1")
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let rows = statement
+            .query_map(params![tenant_id.0.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let mut found = std::collections::BTreeMap::new();
+        for row in rows {
+            let payload = row.map_err(|error| ObservationError::Storage(error.to_string()))?;
+            let observation: Observation = serde_json::from_str(&payload)
+                .map_err(|error| ObservationError::Storage(error.to_string()))?;
+            if ids.contains(&observation.id) {
+                found.insert(observation.id, observation);
+            }
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| found.remove(id))
+            .collect::<Vec<_>>())
+    }
+}
+
+impl InvestigationRepository for SqliteStore {
+    fn create_or_get(
+        &self,
+        idempotency_key: &str,
+        run: &InvestigationRun,
+    ) -> Result<InvestigationCreateResult, ObservationError> {
+        let run_payload = serde_json::to_string(run)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let step = run
+            .steps
+            .first()
+            .ok_or_else(|| ObservationError::Storage("investigation requires one step".into()))?;
+        let step_payload = serde_json::to_string(step)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ObservationError::Storage("sqlite lock poisoned".into()))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let inserted = transaction
+            .execute(
+                "INSERT INTO investigation_runs (id, tenant_id, idempotency_key, status, version, payload)
+                 VALUES (?1, ?2, ?3, 'planned', ?4, ?5)
+                 ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+                params![
+                    run.id.to_string(),
+                    run.tenant_id.0.to_string(),
+                    idempotency_key,
+                    run.version,
+                    run_payload
+                ],
+            )
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let result = if inserted == 1 {
+            transaction
+                .execute(
+                    "INSERT INTO investigation_steps (id, run_id, tenant_id, status, payload)
+                     VALUES (?1, ?2, ?3, 'planned', ?4)",
+                    params![
+                        step.id.to_string(),
+                        run.id.to_string(),
+                        run.tenant_id.0.to_string(),
+                        step_payload
+                    ],
+                )
+                .map_err(|error| ObservationError::Storage(error.to_string()))?;
+            InvestigationCreateResult {
+                run: run.clone(),
+                created: true,
+            }
+        } else {
+            let payload = transaction
+                .query_row(
+                    "SELECT payload FROM investigation_runs
+                     WHERE tenant_id = ?1 AND idempotency_key = ?2",
+                    params![run.tenant_id.0.to_string(), idempotency_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| ObservationError::Storage(error.to_string()))?;
+            InvestigationCreateResult {
+                run: serde_json::from_str(&payload)
+                    .map_err(|error| ObservationError::Storage(error.to_string()))?,
+                created: false,
+            }
+        };
+        transaction
+            .commit()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn get(
+        &self,
+        tenant_id: &TenantId,
+        id: &uuid::Uuid,
+    ) -> Result<Option<InvestigationRun>, ObservationError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ObservationError::Storage("sqlite lock poisoned".into()))?;
+        let payload = connection
+            .query_row(
+                "SELECT payload FROM investigation_runs WHERE id = ?1 AND tenant_id = ?2",
+                params![id.to_string(), tenant_id.0.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        payload
+            .map(|payload| {
+                serde_json::from_str(&payload)
+                    .map_err(|error| ObservationError::Storage(error.to_string()))
+            })
+            .transpose()
+    }
+
+    fn complete(
+        &self,
+        tenant_id: &TenantId,
+        id: &uuid::Uuid,
+        result_observation: &Observation,
+        usage_event: &UsageEvent,
+        now_ms: i64,
+    ) -> Result<InvestigationCompletion, ObservationError> {
+        if result_observation.tenant_id != *tenant_id || usage_event.tenant_id != *tenant_id {
+            return Err(ObservationError::Storage(
+                "investigation result tenant mismatch".into(),
+            ));
+        }
+        if usage_event.source_id != *id || usage_event.source_type != "Investigation" {
+            return Err(ObservationError::Storage(
+                "usage event source must be the investigation".into(),
+            ));
+        }
+        result_observation.validate()?;
+        let result_payload = serde_json::to_string(result_observation)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let usage_kind = serde_json::to_value(&usage_event.kind)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?
+            .as_str()
+            .ok_or_else(|| ObservationError::Storage("invalid usage event kind".into()))?
+            .to_owned();
+
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ObservationError::Storage("sqlite lock poisoned".into()))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let payload = transaction
+            .query_row(
+                "SELECT payload FROM investigation_runs WHERE id = ?1 AND tenant_id = ?2",
+                params![id.to_string(), tenant_id.0.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?
+            .ok_or_else(|| ObservationError::Storage("investigation was not found".into()))?;
+        let mut run: InvestigationRun = serde_json::from_str(&payload)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        if run.status == InvestigationStatus::Completed {
+            transaction
+                .commit()
+                .map_err(|error| ObservationError::Storage(error.to_string()))?;
+            return Ok(InvestigationCompletion {
+                run,
+                completed_now: false,
+            });
+        }
+        if run.status != InvestigationStatus::Planned {
+            return Err(ObservationError::Storage(
+                "investigation is not executable".into(),
+            ));
+        }
+
+        run.status = InvestigationStatus::Running;
+        run.updated_at_ms = now_ms;
+        run.version = run.version.saturating_add(1);
+        run.steps
+            .first_mut()
+            .ok_or_else(|| ObservationError::Storage("investigation step is missing".into()))?
+            .status = InvestigationStepStatus::Running;
+
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO observations (id, tenant_id, started_at_ms, payload)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    result_observation.id.to_string(),
+                    tenant_id.0.to_string(),
+                    result_observation.started_at_ms,
+                    result_payload
+                ],
+            )
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let usage_inserted = transaction
+            .execute(
+                "INSERT INTO usage_events (event_id, tenant_id, occurred_at_ms, period, kind, quantity, source_type, source_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(tenant_id, source_type, source_id, kind) DO NOTHING",
+                params![
+                    usage_event.event_id.to_string(),
+                    tenant_id.0.to_string(),
+                    usage_event.occurred_at_ms,
+                    usage_event.period,
+                    usage_kind,
+                    usage_event.quantity,
+                    usage_event.source_type,
+                    usage_event.source_id.to_string()
+                ],
+            )
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        if usage_inserted == 1 {
+            transaction
+                .execute(
+                    "INSERT INTO usage_entries (tenant_id, period, kind, quantity)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        tenant_id.0.to_string(),
+                        usage_event.period,
+                        usage_kind,
+                        usage_event.quantity
+                    ],
+                )
+                .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        }
+
+        run.status = InvestigationStatus::Completed;
+        run.result_observation_id = Some(result_observation.id);
+        run.updated_at_ms = now_ms;
+        run.version = run.version.saturating_add(1);
+        let step = run
+            .steps
+            .first_mut()
+            .ok_or_else(|| ObservationError::Storage("investigation step is missing".into()))?;
+        step.status = InvestigationStepStatus::Completed;
+        step.output_observation_id = Some(result_observation.id);
+        let step_payload = serde_json::to_string(step)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        let run_payload = serde_json::to_string(&run)
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE investigation_runs SET status = 'completed', version = ?3, payload = ?4
+                 WHERE id = ?1 AND tenant_id = ?2",
+                params![
+                    id.to_string(),
+                    tenant_id.0.to_string(),
+                    run.version,
+                    run_payload
+                ],
+            )
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE investigation_steps SET status = 'completed', payload = ?3
+                 WHERE run_id = ?1 AND tenant_id = ?2",
+                params![id.to_string(), tenant_id.0.to_string(), step_payload],
+            )
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ObservationError::Storage(error.to_string()))?;
+        Ok(InvestigationCompletion {
+            run,
+            completed_now: true,
+        })
+    }
 }
 
 impl UsageRepository for SqliteStore {
@@ -410,7 +726,9 @@ impl UsageRepository for SqliteStore {
 mod tests {
     use super::*;
     use observability_core::{
-        ObservationKind, ObservationQueueRepository, ObservationStatus, QueueDisposition, TenantId,
+        ApprovalPolicy, InvestigationRepository, InvestigationStep, InvestigationStepStatus,
+        ObservationKind, ObservationQueueRepository, ObservationStatus, QueueDisposition, SafeTool,
+        TenantId, UsageEvent,
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -510,7 +828,7 @@ mod tests {
             .unwrap());
         let replay = store.claim_next(400, 500).unwrap().unwrap();
         assert_eq!(replay.attempts, 1);
-        store.complete(&replay.id).unwrap();
+        ObservationQueueRepository::complete(&store, &replay.id).unwrap();
         assert_eq!(
             store.stats(&tenant).unwrap(),
             ObservationQueueStats::default()
@@ -536,5 +854,182 @@ mod tests {
         assert_eq!(store.claim_next(100, 200).unwrap().unwrap().attempts, 1);
         assert!(store.claim_next(199, 300).unwrap().is_none());
         assert_eq!(store.claim_next(200, 300).unwrap().unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn investigation_completion_is_idempotent_and_transactionally_metered() {
+        let store = SqliteStore::open(":memory:").unwrap();
+        let tenant = TenantId(Uuid::new_v4());
+        let evidence = Observation {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            trace_id: "trace".into(),
+            span_id: "span".into(),
+            kind: ObservationKind::Agent,
+            name: "agent.run".into(),
+            status: ObservationStatus::Error,
+            started_at_ms: 1,
+            duration_ms: 2,
+            attributes: BTreeMap::new(),
+        };
+        ObservationRepository::append(&store, &evidence).unwrap();
+        assert_eq!(
+            ObservationRepository::get_many(&store, &tenant, &[evidence.id, Uuid::new_v4()])
+                .unwrap(),
+            vec![evidence.clone()]
+        );
+
+        let run = InvestigationRun {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            objective: "解释失败".into(),
+            status: InvestigationStatus::Planned,
+            evidence_ids: vec![evidence.id],
+            steps: vec![InvestigationStep {
+                id: Uuid::new_v4(),
+                tool: SafeTool::InspectFailureContext,
+                approval_policy: ApprovalPolicy::NotRequired,
+                status: InvestigationStepStatus::Planned,
+                input_hash: "input".into(),
+                output_observation_id: None,
+                error: None,
+            }],
+            result_observation_id: None,
+            error: None,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            version: 1,
+        };
+        let created = InvestigationRepository::create_or_get(&store, "same-key", &run).unwrap();
+        assert!(created.created);
+        let duplicate = InvestigationRepository::create_or_get(&store, "same-key", &run).unwrap();
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.run.id, run.id);
+
+        let result = Observation {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            trace_id: run.id.to_string(),
+            span_id: run.steps[0].id.to_string(),
+            kind: ObservationKind::Tool,
+            name: "investigation.inspect_failure_context".into(),
+            status: ObservationStatus::Ok,
+            started_at_ms: 20,
+            duration_ms: 1,
+            attributes: BTreeMap::new(),
+        };
+        let usage_event = UsageEvent {
+            event_id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            occurred_at_ms: 20,
+            period: "2026-08".into(),
+            kind: observability_core::UsageKind::AgentRun,
+            quantity: 1,
+            source_type: "Investigation".into(),
+            source_id: run.id,
+        };
+        let completed =
+            InvestigationRepository::complete(&store, &tenant, &run.id, &result, &usage_event, 21)
+                .unwrap();
+        assert!(completed.completed_now);
+        assert_eq!(completed.run.status, InvestigationStatus::Completed);
+        let repeated =
+            InvestigationRepository::complete(&store, &tenant, &run.id, &result, &usage_event, 22)
+                .unwrap();
+        assert!(!repeated.completed_now);
+        assert_eq!(
+            UsageRepository::load(&store).unwrap().total(
+                &tenant,
+                "2026-08",
+                &observability_core::UsageKind::AgentRun
+            ),
+            1
+        );
+        assert_eq!(
+            InvestigationRepository::get(&store, &tenant, &run.id)
+                .unwrap()
+                .unwrap()
+                .result_observation_id,
+            Some(result.id)
+        );
+        assert!(
+            InvestigationRepository::get(&store, &TenantId(Uuid::new_v4()), &run.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_investigation_result_does_not_complete_or_meter() {
+        let store = SqliteStore::open(":memory:").unwrap();
+        let tenant = TenantId(Uuid::new_v4());
+        let run = InvestigationRun {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            objective: "解释失败".into(),
+            status: InvestigationStatus::Planned,
+            evidence_ids: Vec::new(),
+            steps: vec![InvestigationStep {
+                id: Uuid::new_v4(),
+                tool: SafeTool::InspectFailureContext,
+                approval_policy: ApprovalPolicy::NotRequired,
+                status: InvestigationStepStatus::Planned,
+                input_hash: "input".into(),
+                output_observation_id: None,
+                error: None,
+            }],
+            result_observation_id: None,
+            error: None,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            version: 1,
+        };
+        InvestigationRepository::create_or_get(&store, "rollback", &run).unwrap();
+        let invalid_result = Observation {
+            id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            trace_id: run.id.to_string(),
+            span_id: run.steps[0].id.to_string(),
+            kind: ObservationKind::Tool,
+            name: String::new(),
+            status: ObservationStatus::Ok,
+            started_at_ms: 20,
+            duration_ms: 1,
+            attributes: BTreeMap::new(),
+        };
+        let usage_event = UsageEvent {
+            event_id: Uuid::new_v4(),
+            tenant_id: tenant.clone(),
+            occurred_at_ms: 20,
+            period: "2026-08".into(),
+            kind: observability_core::UsageKind::AgentRun,
+            quantity: 1,
+            source_type: "Investigation".into(),
+            source_id: run.id,
+        };
+        assert!(InvestigationRepository::complete(
+            &store,
+            &tenant,
+            &run.id,
+            &invalid_result,
+            &usage_event,
+            21,
+        )
+        .is_err());
+        assert_eq!(
+            InvestigationRepository::get(&store, &tenant, &run.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvestigationStatus::Planned
+        );
+        assert_eq!(
+            UsageRepository::load(&store).unwrap().total(
+                &tenant,
+                "2026-08",
+                &observability_core::UsageKind::AgentRun
+            ),
+            0
+        );
     }
 }

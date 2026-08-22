@@ -57,6 +57,11 @@ pub struct JsonlObservationStore {
 pub trait ObservationRepository: Send + Sync {
     fn append(&self, observation: &Observation) -> Result<(), ObservationError>;
     fn list(&self) -> Result<Vec<Observation>, ObservationError>;
+    fn get_many(
+        &self,
+        tenant_id: &TenantId,
+        ids: &[Uuid],
+    ) -> Result<Vec<Observation>, ObservationError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +200,19 @@ impl ObservationRepository for JsonlObservationStore {
     fn list(&self) -> Result<Vec<Observation>, ObservationError> {
         Self::list(self)
     }
+
+    fn get_many(
+        &self,
+        tenant_id: &TenantId,
+        ids: &[Uuid],
+    ) -> Result<Vec<Observation>, ObservationError> {
+        Ok(Self::list(self)?
+            .into_iter()
+            .filter(|observation| {
+                observation.tenant_id == *tenant_id && ids.contains(&observation.id)
+            })
+            .collect())
+    }
 }
 
 impl Observation {
@@ -206,6 +224,133 @@ impl Observation {
             return Err(ObservationError::DurationTooLarge);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InvestigationStatus {
+    Planned,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InvestigationStepStatus {
+    Planned,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SafeTool {
+    InspectFailureContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    NotRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationStep {
+    pub id: Uuid,
+    pub tool: SafeTool,
+    pub approval_policy: ApprovalPolicy,
+    pub status: InvestigationStepStatus,
+    pub input_hash: String,
+    pub output_observation_id: Option<Uuid>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationRun {
+    pub id: Uuid,
+    pub tenant_id: TenantId,
+    pub objective: String,
+    pub status: InvestigationStatus,
+    pub evidence_ids: Vec<Uuid>,
+    pub steps: Vec<InvestigationStep>,
+    pub result_observation_id: Option<Uuid>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationSummary {
+    pub summary: String,
+    pub evidence_ids: Vec<Uuid>,
+    pub failed_observations: usize,
+    pub total_observations: usize,
+    pub slowest_observation_name: Option<String>,
+    pub slowest_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationCreateResult {
+    pub run: InvestigationRun,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationCompletion {
+    pub run: InvestigationRun,
+    pub completed_now: bool,
+}
+
+pub trait InvestigationRepository: Send + Sync {
+    fn create_or_get(
+        &self,
+        idempotency_key: &str,
+        run: &InvestigationRun,
+    ) -> Result<InvestigationCreateResult, ObservationError>;
+    fn get(
+        &self,
+        tenant_id: &TenantId,
+        id: &Uuid,
+    ) -> Result<Option<InvestigationRun>, ObservationError>;
+    fn complete(
+        &self,
+        tenant_id: &TenantId,
+        id: &Uuid,
+        result_observation: &Observation,
+        usage_event: &UsageEvent,
+        now_ms: i64,
+    ) -> Result<InvestigationCompletion, ObservationError>;
+}
+
+pub fn inspect_failure_context(
+    tenant_id: &TenantId,
+    requested_evidence_ids: &[Uuid],
+    observations: &[Observation],
+) -> InvestigationSummary {
+    let evidence = observations
+        .iter()
+        .filter(|observation| {
+            observation.tenant_id == *tenant_id && requested_evidence_ids.contains(&observation.id)
+        })
+        .collect::<Vec<_>>();
+    let failed_observations = evidence
+        .iter()
+        .filter(|observation| observation.status == ObservationStatus::Error)
+        .count();
+    let slowest = evidence
+        .iter()
+        .max_by_key(|observation| observation.duration_ms);
+    InvestigationSummary {
+        summary: format!(
+            "已检查 {} 条租户证据，其中 {} 条失败",
+            evidence.len(),
+            failed_observations
+        ),
+        evidence_ids: evidence.iter().map(|observation| observation.id).collect(),
+        failed_observations,
+        total_observations: evidence.len(),
+        slowest_observation_name: slowest.map(|observation| observation.name.clone()),
+        slowest_duration_ms: slowest.map(|observation| observation.duration_ms),
     }
 }
 
@@ -345,13 +490,14 @@ pub fn execute_safe_tool(
         request.tool_name.as_str(),
         "inspect_failure_context" | "summarize_trace"
     );
-    let evidence_count = observations
+    let verified_evidence_ids = observations
         .iter()
         .filter(|observation| {
             observation.tenant_id == request.tenant_id
                 && request.evidence_ids.contains(&observation.id)
         })
-        .count();
+        .map(|observation| observation.id)
+        .collect::<Vec<_>>();
     if !known {
         return ToolExecutionResult {
             tool_name: request.tool_name.clone(),
@@ -373,9 +519,10 @@ pub fn execute_safe_tool(
         status: "completed".into(),
         output: format!(
             "{} 已基于 {} 条租户范围证据完成",
-            request.tool_name, evidence_count
+            request.tool_name,
+            verified_evidence_ids.len()
         ),
-        evidence_ids: request.evidence_ids.clone(),
+        evidence_ids: verified_evidence_ids,
     }
 }
 
@@ -428,6 +575,18 @@ pub enum UsageKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageEvent {
+    pub event_id: Uuid,
+    pub tenant_id: TenantId,
+    pub occurred_at_ms: i64,
+    pub period: String,
+    pub kind: UsageKind,
+    pub quantity: u64,
+    pub source_type: String,
+    pub source_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageEntry {
     pub tenant_id: TenantId,
     pub period: String,
@@ -448,7 +607,11 @@ pub struct BillingQuote {
     pub period: String,
     pub included_observations: u64,
     pub used_observations: u64,
+    pub included_agent_runs: u64,
+    pub used_agent_runs: u64,
     pub base_price_cents: u64,
+    pub observation_overage_cents: u64,
+    pub agent_run_overage_cents: u64,
     pub overage_cents: u64,
     pub total_cents: u64,
 }
@@ -459,20 +622,28 @@ pub fn quote_monthly_usage(
     period: &str,
     plan: SubscriptionPlan,
 ) -> BillingQuote {
-    let (included, base, unit) = match plan {
-        SubscriptionPlan::Starter => (100_000, 1_900, 3),
-        SubscriptionPlan::Growth => (1_000_000, 9_900, 2),
-        SubscriptionPlan::Scale => (10_000_000, 49_900, 1),
+    let (included, included_agent_runs, base, observation_unit, agent_run_unit) = match plan {
+        SubscriptionPlan::Starter => (100_000, 100, 1_900, 3, 10),
+        SubscriptionPlan::Growth => (1_000_000, 2_000, 9_900, 2, 6),
+        SubscriptionPlan::Scale => (10_000_000, 20_000, 49_900, 1, 3),
     };
-    let used = ledger.total(tenant_id, period, &UsageKind::Observation);
-    let overage_units = used.saturating_sub(included).div_ceil(1_000);
-    let overage_cents = overage_units * unit;
+    let used_observations = ledger.total(tenant_id, period, &UsageKind::Observation);
+    let used_agent_runs = ledger.total(tenant_id, period, &UsageKind::AgentRun);
+    let observation_overage_cents =
+        used_observations.saturating_sub(included).div_ceil(1_000) * observation_unit;
+    let agent_run_overage_cents =
+        used_agent_runs.saturating_sub(included_agent_runs) * agent_run_unit;
+    let overage_cents = observation_overage_cents + agent_run_overage_cents;
     BillingQuote {
         plan,
         period: period.to_owned(),
         included_observations: included,
-        used_observations: used,
+        used_observations,
+        included_agent_runs,
+        used_agent_runs,
         base_price_cents: base,
+        observation_overage_cents,
+        agent_run_overage_cents,
         overage_cents,
         total_cents: base + overage_cents,
     }
@@ -683,6 +854,21 @@ mod tests {
     }
 
     #[test]
+    fn investigation_summary_never_echoes_unverified_evidence() {
+        let mut failure = sample();
+        failure.status = ObservationStatus::Error;
+        failure.duration_ms = 42;
+        let tenant = failure.tenant_id.clone();
+        let foreign = sample();
+        let requested = vec![failure.id, foreign.id, Uuid::new_v4()];
+        let summary = inspect_failure_context(&tenant, &requested, &[failure.clone(), foreign]);
+        assert_eq!(summary.evidence_ids, vec![failure.id]);
+        assert_eq!(summary.failed_observations, 1);
+        assert_eq!(summary.total_observations, 1);
+        assert_eq!(summary.slowest_duration_ms, Some(42));
+    }
+
+    #[test]
     fn unsafe_or_unapproved_tool_is_not_executed() {
         let tenant = TenantId(Uuid::new_v4());
         let request = ToolExecutionRequest {
@@ -704,10 +890,18 @@ mod tests {
             kind: UsageKind::Observation,
             quantity: 101_001,
         });
+        ledger.record(UsageEntry {
+            tenant_id: tenant.clone(),
+            period: "2026-08".into(),
+            kind: UsageKind::AgentRun,
+            quantity: 102,
+        });
         let quote = quote_monthly_usage(&ledger, &tenant, "2026-08", SubscriptionPlan::Starter);
         assert_eq!(quote.base_price_cents, 1_900);
-        assert_eq!(quote.overage_cents, 6);
-        assert_eq!(quote.total_cents, 1_906);
+        assert_eq!(quote.observation_overage_cents, 6);
+        assert_eq!(quote.agent_run_overage_cents, 20);
+        assert_eq!(quote.overage_cents, 26);
+        assert_eq!(quote.total_cents, 1_926);
     }
 
     #[test]

@@ -14,6 +14,7 @@ const state = {
   deadLetters: [],
   usage: [],
   selectedEvidence: new Set(),
+  lastInvestigation: null,
   config: {
     apiUrl: "http://127.0.0.1:8080",
     tenantId: "",
@@ -75,7 +76,16 @@ class ApiError extends Error {
 
 function currentMonth() {
   const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function investigationStorageKey() {
+  return `observability.investigation.${state.config.tenantId}`;
+}
+
+function newIdempotencyKey() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `console-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function escapeHtml(value) {
@@ -263,6 +273,7 @@ async function loadData({ announce = true } = {}) {
     );
     state.connected = true;
     renderAll();
+    await recoverLastInvestigation();
     setConnectionState("connected", "已连接");
     setFormMessage(elements.connectionMessage, "连接成功，数据来自当前 Rust API。", "success");
     elements.lastSync.textContent = `同步于 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
@@ -426,6 +437,53 @@ function formatTimestamp(value) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function statusLabel(status) {
+  return ({ Planned: "待执行", Running: "执行中", Completed: "已完成", Failed: "失败" })[status] || status;
+}
+
+function renderInvestigation(run) {
+  if (!run) {
+    elements.agentResult.hidden = true;
+    return;
+  }
+  state.lastInvestigation = run;
+  const step = Array.isArray(run.steps) ? run.steps[0] : null;
+  const resume = run.status === "Planned"
+    ? `<button class="secondary-button" type="button" data-resume-investigation="${escapeHtml(run.id)}">继续执行</button>`
+    : "";
+  const result = run.result_observation_id
+    ? `<li><strong>结果 Observation</strong> — <code>${escapeHtml(run.result_observation_id)}</code></li>`
+    : "";
+  const error = run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : "";
+  elements.agentResult.innerHTML = `<h3>持久化调查 · ${escapeHtml(statusLabel(run.status))}</h3><p>${escapeHtml(run.objective)}</p><ul><li><strong>Run</strong> — <code>${escapeHtml(run.id)}</code></li><li><strong>Evidence</strong> — ${numberFormat.format(run.evidence_ids?.length || 0)} 条</li>${step ? `<li><strong>安全工具</strong> — ${escapeHtml(step.tool)} / ${escapeHtml(step.status)}</li>` : ""}${result}</ul>${error}${resume}`;
+  elements.agentResult.hidden = false;
+}
+
+async function recoverLastInvestigation() {
+  const id = readStorage(localStorage, investigationStorageKey());
+  if (!id || !UUID_PATTERN.test(id)) return;
+  try {
+    const run = await request(`/v1/investigations/${encodeURIComponent(id)}`);
+    renderInvestigation(run);
+    setFormMessage(elements.agentMessage, `已恢复${statusLabel(run.status)}的调查运行。`, "success");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      writeStorage(localStorage, investigationStorageKey(), "");
+      return;
+    }
+    if (!(error instanceof ApiError && error.status === 409)) throw error;
+  }
+}
+
+async function executeInvestigation(id) {
+  setFormMessage(elements.agentMessage, "正在执行租户隔离的只读调查…");
+  const run = await request(`/v1/investigations/${encodeURIComponent(id)}/execute`, { method: "POST" });
+  writeStorage(localStorage, investigationStorageKey(), run.id);
+  renderInvestigation(run);
+  setFormMessage(elements.agentMessage, `调查${statusLabel(run.status)}；AgentRun 用量由服务端幂等记录。`, "success");
+  return run;
+}
+
 async function runAgent(event) {
   event.preventDefault();
   const objective = elements.agentObjective.value.trim();
@@ -438,21 +496,21 @@ async function runAgent(event) {
     return;
   }
   elements.runAgent.disabled = true;
-  setFormMessage(elements.agentMessage, "正在生成证据约束的计划…");
+  setFormMessage(elements.agentMessage, "正在创建可恢复的调查运行…");
   elements.agentResult.hidden = true;
   try {
-    const decision = await request("/v1/agent/plan", {
+    const run = await request("/v1/investigations", {
       method: "POST",
+      headers: { "idempotency-key": newIdempotencyKey() },
       body: JSON.stringify({
-        tenant_id: state.config.tenantId,
         objective,
-        observation_ids: [...state.selectedEvidence],
+        evidence_ids: [...state.selectedEvidence],
       }),
     });
-    const actions = Array.isArray(decision.actions) ? decision.actions : [];
-    elements.agentResult.innerHTML = `<h3>调查计划</h3><p>${escapeHtml(decision.summary)}</p><ul>${actions.map((action) => `<li><strong>${escapeHtml(action.tool_name)}</strong> — ${escapeHtml(action.reason)}${action.requires_approval ? "（需要审批）" : ""}</li>`).join("")}</ul>`;
-    elements.agentResult.hidden = false;
-    setFormMessage(elements.agentMessage, `计划引用 ${numberFormat.format(decision.evidence_ids?.length || 0)} 条证据。`, "success");
+    writeStorage(localStorage, investigationStorageKey(), run.id);
+    renderInvestigation(run);
+    await executeInvestigation(run.id);
+    await loadData({ announce: false });
   } catch (error) {
     setFormMessage(elements.agentMessage, humanizeError(error), "error");
   } finally {
@@ -474,7 +532,7 @@ async function calculateQuote(event) {
         plan: elements.planSelect.value,
       }),
     });
-    elements.quoteOutput.textContent = `${currencyFormat.format(quote.total_cents / 100)} / 月 · 已用 ${numberFormat.format(quote.used_observations)} / 包含 ${numberFormat.format(quote.included_observations)}`;
+    elements.quoteOutput.textContent = `${currencyFormat.format(quote.total_cents / 100)} / 月 · Observation ${numberFormat.format(quote.used_observations)} / ${numberFormat.format(quote.included_observations)} · Agent 调查 ${numberFormat.format(quote.used_agent_runs)} / ${numberFormat.format(quote.included_agent_runs)}`;
   } catch (error) {
     elements.quoteOutput.textContent = humanizeError(error);
   } finally {
@@ -536,6 +594,19 @@ elements.observationRows.addEventListener("change", (event) => {
 elements.deadLetterList.addEventListener("click", (event) => {
   const button = event.target.closest("[data-replay-id]");
   if (button) replayDeadLetter(button.dataset.replayId, button);
+});
+
+elements.agentResult.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-resume-investigation]");
+  if (!button) return;
+  button.disabled = true;
+  try {
+    await executeInvestigation(button.dataset.resumeInvestigation);
+    await loadData({ announce: false });
+  } catch (error) {
+    setFormMessage(elements.agentMessage, humanizeError(error), "error");
+    button.disabled = false;
+  }
 });
 
 elements.toggleConnection.addEventListener("click", () => {

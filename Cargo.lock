@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "observability-agent"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "observability-core",
  "reqwest",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "observability-api"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "axum",
  "flate2",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "observability-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "observability-sqlite"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "observability-core",
  "rusqlite",

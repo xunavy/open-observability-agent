@@ -8,10 +8,10 @@
 
 ## 当前能力边界
 
-- Rust API 支持租户隔离的 Observation、诊断、Agent 计划/安全工具执行、OpenAI-compatible 模型适配、用量账本与月度报价。
+- Rust API 支持租户隔离的 Observation、诊断、持久化 Investigation Run、安全工具执行、OpenAI-compatible 模型适配、可信用量账本与月度报价。
 - OTLP/HTTP `POST /v1/traces` 支持 protobuf 与 OTLP JSON，将标准 span 映射为可供诊断和 Agent 引用的 Observation。
 - SQLite 模式支持单实例持久化摄取队列、租约恢复、指数退避、死信查询和租户级重放。
-- 静态 Web 控制台已接入真实 API，支持观测筛选、诊断、队列/死信重放、证据选择、Agent 调查计划、用量和月度报价；页面不注入演示数据。
+- 静态 Web 控制台已接入真实 API，支持观测筛选、诊断、队列/死信重放、证据选择、Agent 调查执行/恢复、用量和月度报价；页面不注入演示数据。
 - 这仍是可运行 MVP：尚未完成多实例数据库/队列、组织 RBAC、支付订阅同步和真实云环境验收，不应直接接收生产敏感数据。
 
 ## 目标架构
@@ -47,6 +47,9 @@ GET  /v1/observations?tenant_id=<uuid>
 POST /v1/diagnostics
 POST /v1/agent/plan
 POST /v1/agent/execute
+POST /v1/investigations                    # Idempotency-Key header
+GET  /v1/investigations/<run-id>
+POST /v1/investigations/<run-id>/execute
 POST /v1/model/complete
 POST /v1/usage
 GET  /v1/usage?tenant_id=<uuid>&period=2026-08
@@ -62,7 +65,7 @@ POST /v1/ingestion/dead-letters/replay
 cargo run -p observability-api
 ```
 
-服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。控制台位于 `apps/console`，可直接部署到静态托管服务，也可在仓库根目录运行 `python -m http.server 4173 --directory apps/console` 后访问 `http://127.0.0.1:4173`。在“连接设置”中填写 API 地址、tenant UUID 和 API key；API key 仅保存在当前浏览器标签页的 `sessionStorage`。
+服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。持久化调查需要设置 `OBSERVABILITY_STORAGE=sqlite`（Docker Compose 已默认启用）；控制台位于 `apps/console`，可直接部署到静态托管服务，也可在仓库根目录运行 `python -m http.server 4173 --directory apps/console` 后访问 `http://127.0.0.1:4173`。在“连接设置”中填写 API 地址、tenant UUID 和 API key；API key 仅保存在当前浏览器标签页的 `sessionStorage`。
 
 API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；指标包括服务存活、存储/摄取模式、接收量、模型与 Agent 调用量、队列处理、重试和死信计数。
 
@@ -72,7 +75,9 @@ OpenTelemetry SDK/Collector 可把 OTLP/HTTP endpoint 指向 `http://localhost:8
 
 用量账本默认写入 `data/usage.jsonl`，可通过 `OBSERVABILITY_USAGE_DATA` 指定路径；API 启动时会恢复已有账本。
 
-单实例 SQLite 模式：设置 `OBSERVABILITY_STORAGE=sqlite`，数据库默认写入 `data/observability.sqlite`，也可通过 `OBSERVABILITY_SQLITE_DATA` 配置。再设置 `OBSERVABILITY_INGEST_MODE=durable` 后，单条和批量摄取先原子写入队列并返回 `202 Accepted`，后台 worker 再写入 observation store；默认 `direct` 模式保持同步写入并返回 `201 Created`。
+单实例 SQLite 模式：设置 `OBSERVABILITY_STORAGE=sqlite`，数据库默认写入 `data/observability.sqlite`，也可通过 `OBSERVABILITY_SQLITE_DATA` 配置。Investigation Run、Step、结果 Observation 和幂等 UsageEvent 使用这一数据库。再设置 `OBSERVABILITY_INGEST_MODE=durable` 后，单条和批量摄取先原子写入队列并返回 `202 Accepted`，后台 worker 再写入 observation store；默认 `direct` 模式保持同步写入并返回 `201 Created`。
+
+生产环境的调查接口只接受 `OBSERVABILITY_API_KEYS` 中的 tenant-scoped key。`POST /v1/investigations` 不接受 body tenant，必须发送 `X-Tenant-ID`、`X-API-Key` 和 `Idempotency-Key`；执行会再次验证 evidence，并在一个事务中完成 Run、结果 Observation 和一次 AgentRun 计费。重复创建/执行不会重复计费。tenant key 不能直接调用 `POST /v1/usage` 伪造用量；该入口只保留给内部全局 key。
 
 持久队列可通过 `OBSERVABILITY_QUEUE_MAX_ATTEMPTS`、`OBSERVABILITY_QUEUE_POLL_MS` 和 `OBSERVABILITY_QUEUE_LEASE_MS` 调整。死信接口始终执行 tenant 校验；队列未启用时返回 `409 Conflict`。
 
@@ -80,11 +85,13 @@ OpenTelemetry SDK/Collector 可把 OTLP/HTTP endpoint 指向 `http://localhost:8
 
 单租户部署可额外设置 `OBSERVABILITY_TENANT_ID=<uuid>`；所有 observation、Agent、model、usage 和 billing 请求的 tenant_id 不匹配时都会返回 `403`。多租户 SaaS 仍需将此配置替换为持久化的 tenant-scoped key/RBAC。
 
-容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查、Clippy、workspace 测试、控制台 JavaScript 语法检查、持久队列重启 smoke、tenant auth/CORS smoke 和 OTLP trace smoke。
+容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查、Clippy、workspace 测试、控制台 JavaScript 语法检查、持久队列重启 smoke、tenant auth/CORS、OTLP trace 和 Investigation 重启/幂等计费 smoke。
 
 本地容器启动：复制 `.env.example` 为 `.env` 后运行 `docker compose up --build`；API 使用 SQLite volume 持久化并提供 `/health` 健康检查。
 
 API 契约见 [docs/openapi.yaml](docs/openapi.yaml)。
+
+领域词汇与上下文边界见 [CONTEXT.md](CONTEXT.md)。
 
 生产验收边界见 [docs/production-readiness.md](docs/production-readiness.md)。
 
@@ -103,3 +110,5 @@ SQLite backend 位于 `crates/observability-sqlite`，当前用于单实例验�
 可运行 `bash ./scripts/smoke-tenant-auth.sh` 验证生产 tenant key、公开健康检查和跨租户拒绝链路。
 
 可运行 `bash ./scripts/smoke-otlp.sh` 验证 OTLP JSON trace、tenant key、持久队列、重试去重和 Observation 映射链路。
+
+可运行 `bash ./scripts/smoke-investigation.sh` 验证 tenant evidence 隔离、创建/执行幂等、服务重启恢复、可信 AgentRun 用量和防伪造入口。

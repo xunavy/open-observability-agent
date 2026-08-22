@@ -184,7 +184,7 @@
       <div class="investigation-copy">
         <p class="section-index">05 / agent investigation</p>
         <h2 id="investigation-title">让 Agent 引用证据，而不是猜测。</h2>
-        <p>从观测表勾选 evidence。计划器只会读取当前 tenant 且明确选中的 observation IDs。</p>
+        <p>从观测表勾选 evidence。运行状态写入 SQLite，刷新或重启后仍可恢复；工具只能读取当前 tenant 已验证的 observation IDs。</p>
         <div class="evidence-preview" id="evidence-preview">尚未选择证据</div>
       </div>
       <form class="investigation-form" id="investigation-form">
@@ -192,7 +192,7 @@
         <textarea id="agent-objective" rows="4" placeholder="例如：解释最近失败观测的共同原因，并给出下一步安全检查。" required></textarea>
         <div class="form-row">
           <span id="agent-form-message" class="form-message" role="status"></span>
-          <button class="primary-button" type="submit" disabled id="run-agent">生成调查计划</button>
+          <button class="primary-button" type="submit" disabled id="run-agent">运行持久化调查</button>
         </div>
         <article class="agent-result" id="agent-result" hidden aria-live="polite"></article>
       </form>

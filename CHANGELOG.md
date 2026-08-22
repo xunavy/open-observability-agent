@@ -4,6 +4,17 @@
 
 下一阶段聚焦 OTLP metrics/logs、组织身份与多实例存储。
 
+## 0.4.0 - 2026-08-23
+
+- 增加 SQLite 持久化 Investigation Run 与 Step；创建使用 tenant 范围 `Idempotency-Key`，刷新或 API 重启后可恢复。
+- 调查执行只接受服务端选择的只读安全工具，并在执行前重新验证全部 evidence 属于认证 tenant。
+- 在同一 SQLite 事务中提交运行完成状态、结果 Observation、幂等 UsageEvent 和月度 AgentRun 用量；重试不会重复计费。
+- 生产模式禁止 tenant key 直接伪造 `/v1/usage`，并允许 tenant key 与内部全局 key 同时配置。
+- 月度报价增加各套餐包含的 Agent Run、已用量和超额费用，所有金额继续使用整数分。
+- 模型 token usage 改为 UTC `YYYY-MM` 周期，并在调用 provider 前验证 tenant evidence。
+- 控制台改为创建、执行和恢复真实 Investigation Run，不再只显示瞬时计划。
+- 新增跨租户 evidence、幂等创建/执行、事务回滚、重启恢复和重复计费 smoke。
+
 ## 0.3.1 - 2026-08-23
 
 - 支持 OTLP/HTTP `Content-Encoding: gzip`。

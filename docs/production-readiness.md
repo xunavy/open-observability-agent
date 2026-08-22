@@ -10,7 +10,10 @@
 - Agent 决策返回 evidence IDs。
 - 工具执行具备 allowlist 和 approval 状态。
 - 月度报价使用整数分。
-- 控制台已通过真实浏览器连接 API，验证 tenant key、观测筛选、evidence 选择、Agent plan、队列状态、usage、billing quote 和移动端布局。
+- SQLite Investigation Run/Step 可恢复；结果 Observation、Run 完成状态和 AgentRun UsageEvent 在同一事务提交。
+- Investigation 创建和执行具备 tenant evidence 校验、幂等 key、重复执行不重复计费和跨租户不可见测试。
+- 月度报价同时计算 Observation 与 AgentRun 套餐用量；生产 tenant key 不能直接写 usage。
+- 控制台已通过真实浏览器连接 API，验证 tenant key、观测筛选、evidence 选择、Investigation 执行/恢复、队列状态、usage、billing quote 和移动端布局。
 - OTLP/HTTP trace 接口已支持 protobuf/JSON、tenant header、partial success、确定性 Observation ID 和 durable queue。
 
 ## 尚未达到生产标准
@@ -25,7 +28,7 @@
 - CORS 支持显式来源、方法和请求头 allowlist；未配置来源时仍为本地开发用 permissive 模式。
 - 已增加 `OBSERVABILITY_TENANT_ID` 单租户运行时边界；不匹配的请求返回 403，但这仍不是多租户 RBAC。
 - 已增加 `OBSERVABILITY_API_KEYS` 的 tenant-to-secret 映射模式；请求必须同时提供 `X-API-Key` 与 `X-Tenant-ID`，业务 body/query tenant 也会再次校验。该模式仍缺少持久化密钥轮换和组织 RBAC。
-- Agent 规划器仍是确定性规则；`/v1/model/complete` 已支持确定性 fallback 和 OpenAI-compatible provider，并记录 token usage，但尚缺 token 预算、提示词版本、超时/熔断和精确模型成本。
+- Investigation 当前只有确定性只读工具；`/v1/model/complete` 已支持确定性 fallback 和 OpenAI-compatible provider，并按 UTC 自然月记录 token usage，但尚缺 token 预算、提示词版本、超时/熔断和精确模型成本。
 - 尚未完成支付商 webhook、订阅状态同步、退款和税务边界。
 - 尚未完成 Cloudflare/Vercel 的真实部署与域名、密钥、日志验证。
 

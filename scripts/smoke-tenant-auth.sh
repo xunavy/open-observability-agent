@@ -42,12 +42,13 @@ preflight="$(curl_local -sS -o /dev/null -D "$cors_headers" -w '%{http_code}' \
   -X OPTIONS http://127.0.0.1:8080/v1/observations \
   -H 'origin: http://console.example.test' \
   -H 'access-control-request-method: POST' \
-  -H 'access-control-request-headers: content-type,x-api-key,x-tenant-id')"
+  -H 'access-control-request-headers: content-type,x-api-key,x-tenant-id,idempotency-key')"
 test "$preflight" = "200"
 grep -qi '^access-control-allow-origin: http://console.example.test' "$cors_headers"
 grep -qi '^access-control-allow-methods:.*POST' "$cors_headers"
 grep -qi '^access-control-allow-headers:.*x-api-key' "$cors_headers"
 grep -qi '^access-control-allow-headers:.*x-tenant-id' "$cors_headers"
+grep -qi '^access-control-allow-headers:.*idempotency-key' "$cors_headers"
 
 unauthorized="$(curl_local -sS -o "$response_file" -w '%{http_code}' http://127.0.0.1:8080/metrics)"
 test "$unauthorized" = "401"
