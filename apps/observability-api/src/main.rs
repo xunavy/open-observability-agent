@@ -1,7 +1,10 @@
 use axum::{
     body::Body,
     extract::{Extension, Query, State},
-    http::{header::HeaderValue, Request, StatusCode},
+    http::{
+        header::{HeaderName, HeaderValue},
+        Method, Request, StatusCode,
+    },
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
@@ -651,7 +654,14 @@ fn cors_layer() -> CorsLayer {
                 .split(',')
                 .filter_map(|origin| HeaderValue::from_str(origin.trim()).ok())
                 .collect();
-            CorsLayer::new().allow_origin(AllowOrigin::list(values))
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(values))
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderName::from_static("x-api-key"),
+                    HeaderName::from_static("x-tenant-id"),
+                ])
         }
         Err(_) => CorsLayer::permissive(),
     }

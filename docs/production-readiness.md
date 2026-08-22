@@ -10,6 +10,7 @@
 - Agent 决策返回 evidence IDs。
 - 工具执行具备 allowlist 和 approval 状态。
 - 月度报价使用整数分。
+- 控制台已通过真实浏览器连接 API，验证 tenant key、观测筛选、evidence 选择、Agent plan、队列状态、usage、billing quote 和移动端布局。
 
 ## 尚未达到生产标准
 
@@ -19,7 +20,7 @@
 - 当前批量 ingestion 限制为每请求 1000 条；该限制不是队列或租户级配额的替代品。
 - 当前 API 以 8 个并发批次槽位提供入口背压，槽位耗尽返回 429；这不能替代租户级速率限制和磁盘容量保护。
 - API key 不是完整身份系统；生产需要组织、项目、RBAC、密钥轮换和审计。
-- CORS 当前为 permissive 原型配置，生产必须使用 allowlist。
+- CORS 支持显式来源、方法和请求头 allowlist；未配置来源时仍为本地开发用 permissive 模式。
 - 已增加 `OBSERVABILITY_TENANT_ID` 单租户运行时边界；不匹配的请求返回 403，但这仍不是多租户 RBAC。
 - 已增加 `OBSERVABILITY_API_KEYS` 的 tenant-to-secret 映射模式；请求必须同时提供 `X-API-Key` 与 `X-Tenant-ID`，业务 body/query tenant 也会再次校验。该模式仍缺少持久化密钥轮换和组织 RBAC。
 - Agent 规划器仍是确定性规则；`/v1/model/complete` 已支持确定性 fallback 和 OpenAI-compatible provider，并记录 token usage，但尚缺 token 预算、提示词版本、超时/熔断和精确模型成本。
@@ -31,5 +32,5 @@
 1. 用 PostgreSQL/ClickHouse 与托管队列实现当前 repository trait，完成多实例一致性和容量保护。
 2. 完成 OTLP 接入、租户速率/存储配额和数据保留策略。
 3. 为模型 provider 增加预算、提示词版本、超时/熔断和真实成本映射。
-4. 完成控制台 API 联调和认证流程。
+4. 将控制台的运维 API key 连接方式替换为 OIDC/session、组织权限和服务端密钥代理。
 5. 在 Linux CI、容器和目标云环境分别执行测试、smoke 和回滚演练。

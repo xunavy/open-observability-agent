@@ -1,7 +1,8 @@
 /target/
 /data/
+/.playwright-cli/
+/output/playwright/
 *.log
 .env
 .env.*
 !.env.example
-

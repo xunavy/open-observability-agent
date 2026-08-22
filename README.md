@@ -10,6 +10,7 @@
 
 - Rust API 支持租户隔离的 Observation、诊断、Agent 计划/安全工具执行、OpenAI-compatible 模型适配、用量账本与月度报价。
 - SQLite 模式支持单实例持久化摄取队列、租约恢复、指数退避、死信查询和租户级重放。
+- 静态 Web 控制台已接入真实 API，支持观测筛选、诊断、队列/死信重放、证据选择、Agent 调查计划、用量和月度报价；页面不注入演示数据。
 - 这仍是可运行 MVP：尚未完成多实例数据库/队列、组织 RBAC、支付订阅同步和真实云环境验收，不应直接接收生产敏感数据。
 
 ## 目标架构
@@ -59,7 +60,7 @@ POST /v1/ingestion/dead-letters/replay
 cargo run -p observability-api
 ```
 
-服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。控制台原型位于 `apps/console/index.html`，可部署到静态托管服务后，将 API 地址接入前端。
+服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。控制台位于 `apps/console`，可直接部署到静态托管服务，也可在仓库根目录运行 `python -m http.server 4173 --directory apps/console` 后访问 `http://127.0.0.1:4173`。在“连接设置”中填写 API 地址、tenant UUID 和 API key；API key 仅保存在当前浏览器标签页的 `sessionStorage`。
 
 API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；指标包括服务存活、存储/摄取模式、接收量、模型与 Agent 调用量、队列处理、重试和死信计数。
 
@@ -75,7 +76,7 @@ API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Gra
 
 单租户部署可额外设置 `OBSERVABILITY_TENANT_ID=<uuid>`；所有 observation、Agent、model、usage 和 billing 请求的 tenant_id 不匹配时都会返回 `403`。多租户 SaaS 仍需将此配置替换为持久化的 tenant-scoped key/RBAC。
 
-容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查、workspace 测试和持久队列重启 smoke。
+容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查、Clippy、workspace 测试、控制台 JavaScript 语法检查、持久队列重启 smoke，以及 tenant auth/CORS smoke。
 
 本地容器启动：复制 `.env.example` 为 `.env` 后运行 `docker compose up --build`；API 使用 SQLite volume 持久化并提供 `/health` 健康检查。
 

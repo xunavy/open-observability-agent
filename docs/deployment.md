@@ -23,9 +23,11 @@ API 支持 `OBSERVABILITY_STORAGE=sqlite` 启用 SQLite 单实例 backend；它�
 
 ## 控制台
 
-`apps/console` 是静态控制台原型，可部署到 Vercel 或 Cloudflare Pages。当前页面使用演示数据，尚未接入 API，因此不能当作生产控制台。
+`apps/console` 是零构建依赖的静态控制台，可部署到 Vercel 或 Cloudflare Pages。它直接读取 Rust API，覆盖观测筛选、诊断发现、持久队列、死信重放、Agent evidence 计划、usage 和 billing quote；没有连接或 API 返回空集时显示明确的空状态，不生成演示数据。
 
-本地开发未设置 `OBSERVABILITY_CORS_ORIGINS` 时仍启用 permissive CORS；生产必须设置逗号分隔的控制台域名 allowlist，例如 `https://console.example.com`。设置 `OBSERVABILITY_ENV=production` 后，必须配置非空 `OBSERVABILITY_API_KEY` 或 `OBSERVABILITY_API_KEYS`，否则除 `/health` 外的请求会失败。环境变量密钥仍不是完整的组织/RBAC/轮换系统。
+控制台会把 API 地址和 tenant UUID 写入 `localStorage`，API key 只写入当前标签页的 `sessionStorage`。这是用于开发和受控运维的连接方式，不是面向客户的 SaaS 登录系统；生产仍需要 OIDC/session、组织/项目权限、服务端密钥代理、CSRF 防护和审计。
+
+本地开发未设置 `OBSERVABILITY_CORS_ORIGINS` 时仍启用 permissive CORS；设置 allowlist 后，API 只允许指定来源使用 `GET`/`POST` 及 `content-type`、`X-API-Key`、`X-Tenant-ID` 请求头。生产必须设置逗号分隔的控制台域名 allowlist，例如 `https://console.example.com`。设置 `OBSERVABILITY_ENV=production` 后，必须配置非空 `OBSERVABILITY_API_KEY` 或 `OBSERVABILITY_API_KEYS`，否则除 `/health` 外的请求会失败。环境变量密钥仍不是完整的组织/RBAC/轮换系统。
 
 设置 `OBSERVABILITY_API_KEY` 后，业务 API 要求请求头 `X-API-Key`；租户映射模式还要求 `X-Tenant-ID`。未设置时认证关闭，仅适合本地开发。
 
