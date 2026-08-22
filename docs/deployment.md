@@ -25,7 +25,7 @@ API 支持 `OBSERVABILITY_STORAGE=sqlite` 启用 SQLite 单实例 backend；它�
 
 Rust API 按 [OTLP 1.11.0](https://opentelemetry.io/docs/specs/otlp/) 的 HTTP trace 路径，在 `POST /v1/traces` 接受 protobuf 与 JSON 编码的 `ExportTraceServiceRequest`。OpenTelemetry SDK 或 Collector 的 endpoint 可设置为 `http://api-host:8080`，并通过 exporter headers 发送 `x-tenant-id=<UUID>` 和 `x-api-key=<secret>`。API 会把 resource、instrumentation scope 和 span attributes 保留到 Observation，并把 GenAI/Agent/Tool/HTTP 语义分类到现有领域模型。
 
-当前每个请求最多 4 MiB / 1000 spans；非法 span 使用 OTLP `partial_success` 报告。标准要求的 gzip request body 尚未实现，发送非 `identity` 的 `Content-Encoding` 会返回 `415`，因此这仍是 OTLP/HTTP 的早期兼容实现。
+当前每个请求最多 4 MiB / 1000 spans；非法 span 使用 OTLP `partial_success` 报告。`Content-Encoding: gzip` 使用纯 Rust backend 解压，并再次执行 4 MiB 解压后上限以限制压缩炸弹；其他 content encoding 返回 `415`。OTLP/gRPC、metrics 和 logs signals 仍未实现。
 
 ## 控制台
 

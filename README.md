@@ -66,7 +66,7 @@ cargo run -p observability-api
 
 API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；指标包括服务存活、存储/摄取模式、接收量、模型与 Agent 调用量、队列处理、重试和死信计数。
 
-OpenTelemetry SDK/Collector 可把 OTLP/HTTP endpoint 指向 `http://localhost:8080`，trace path 使用标准 `/v1/traces`；exporter headers 必须包含 `x-tenant-id=<tenant UUID>`，启用认证后还需 `x-api-key=<secret>`。服务接受 `application/x-protobuf` 和 OTLP JSON，单请求限制为 4 MiB / 1000 spans，非法 span 通过 OTLP `partial_success` 返回。当前尚未支持 gzip request body。
+OpenTelemetry SDK/Collector 可把 OTLP/HTTP endpoint 指向 `http://localhost:8080`，trace path 使用标准 `/v1/traces`；exporter headers 必须包含 `x-tenant-id=<tenant UUID>`，启用认证后还需 `x-api-key=<secret>`。服务接受 `application/x-protobuf` 和 OTLP JSON，以及 `Content-Encoding: gzip`；压缩前和解压后均限制为 4 MiB，单请求最多 1000 spans，非法 span 通过 OTLP `partial_success` 返回。
 
 生产环境请设置 `OBSERVABILITY_API_KEY`，客户端使用 `X-API-Key` 请求头；本地开发可以不设置。
 

@@ -1,3 +1,4 @@
+use flate2::read::GzDecoder;
 use observability_core::{Observation, ObservationKind, ObservationStatus, TenantId};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::{
@@ -8,7 +9,7 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 use serde_json::{Map, Number, Value};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, io::Read};
 use uuid::Uuid;
 
 const OBSERVATION_NAMESPACE: Uuid = Uuid::from_u128(0x72a1b31d_1ea6_43b5_98ec_111cd8c25642);
@@ -46,6 +47,9 @@ impl OtlpEncoding {
 #[derive(Debug, PartialEq, Eq)]
 pub enum OtlpError {
     UnsupportedContentType,
+    UnsupportedContentEncoding(String),
+    InvalidCompressedPayload(String),
+    PayloadTooLarge,
     InvalidPayload(String),
     ResponseEncoding(String),
 }
@@ -55,6 +59,15 @@ impl fmt::Display for OtlpError {
         match self {
             Self::UnsupportedContentType => formatter
                 .write_str("content-type must be application/x-protobuf or application/json"),
+            Self::UnsupportedContentEncoding(encoding) => {
+                write!(formatter, "content-encoding {encoding} is not supported")
+            }
+            Self::InvalidCompressedPayload(message) => {
+                write!(formatter, "invalid gzip OTLP payload: {message}")
+            }
+            Self::PayloadTooLarge => {
+                formatter.write_str("decoded OTLP payload exceeds the 4 MiB limit")
+            }
             Self::InvalidPayload(message) => {
                 write!(formatter, "invalid OTLP trace payload: {message}")
             }
@@ -63,6 +76,35 @@ impl fmt::Display for OtlpError {
             }
         }
     }
+}
+
+pub fn decode_body(
+    content_encoding: Option<&str>,
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, OtlpError> {
+    let content_encoding = content_encoding.unwrap_or("identity").trim();
+    if content_encoding.is_empty() || content_encoding.eq_ignore_ascii_case("identity") {
+        return (body.len() <= max_decoded_bytes)
+            .then(|| body.to_vec())
+            .ok_or(OtlpError::PayloadTooLarge);
+    }
+    if !content_encoding.eq_ignore_ascii_case("gzip") {
+        return Err(OtlpError::UnsupportedContentEncoding(
+            content_encoding.into(),
+        ));
+    }
+
+    let decoder = GzDecoder::new(body);
+    let mut decoded = Vec::with_capacity(body.len().min(max_decoded_bytes));
+    decoder
+        .take(max_decoded_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut decoded)
+        .map_err(|error| OtlpError::InvalidCompressedPayload(error.to_string()))?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(OtlpError::PayloadTooLarge);
+    }
+    Ok(decoded)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -404,6 +446,7 @@ fn hex(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::GzEncoder, Compression};
     use opentelemetry_proto::tonic::{
         common::v1::{AnyValue, InstrumentationScope, KeyValue},
         resource::v1::Resource,
@@ -418,6 +461,14 @@ mod tests {
             }),
             key_strindex: 0,
         }
+    }
+
+    fn gzip(value: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(value).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn span(trace_byte: u8, span_byte: u8) -> Span {
@@ -468,6 +519,29 @@ mod tests {
 
         let json = serde_json::to_vec(&expected).unwrap();
         assert_eq!(decode_request(OtlpEncoding::Json, &json).unwrap(), expected);
+    }
+
+    #[test]
+    fn decodes_gzip_with_a_post_decompression_limit() {
+        let compressed = gzip(b"trace payload");
+        assert_eq!(
+            decode_body(Some("gzip"), &compressed, 128).unwrap(),
+            b"trace payload"
+        );
+
+        let oversized = gzip(&[b'a'; 129]);
+        assert_eq!(
+            decode_body(Some("gzip"), &oversized, 128).unwrap_err(),
+            OtlpError::PayloadTooLarge
+        );
+        assert!(matches!(
+            decode_body(Some("br"), b"payload", 128),
+            Err(OtlpError::UnsupportedContentEncoding(_))
+        ));
+        assert!(matches!(
+            decode_body(Some("gzip"), b"not gzip", 128),
+            Err(OtlpError::InvalidCompressedPayload(_))
+        ));
     }
 
     #[test]

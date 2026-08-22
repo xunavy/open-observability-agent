@@ -6,9 +6,11 @@ database="/tmp/open-observability-otlp.sqlite"
 log_file="/tmp/open-observability-otlp.log"
 response_file="/tmp/open-observability-otlp-response.json"
 observations_file="/tmp/open-observability-otlp-observations.json"
+gzip_file="/tmp/open-observability-otlp-traces.json.gz"
 tenant="$(cat /proc/sys/kernel/random/uuid)"
 api_key="otlp-smoke-secret"
-rm -f "$database" "$database-shm" "$database-wal" "$log_file" "$response_file" "$observations_file"
+rm -f "$database" "$database-shm" "$database-wal" "$log_file" "$response_file" "$observations_file" "$gzip_file"
+gzip -c examples/otlp-traces.json >"$gzip_file"
 
 curl_local() {
   curl --noproxy '*' --connect-timeout 1 --max-time 3 "$@"
@@ -36,15 +38,22 @@ for _ in $(seq 1 180); do
 done
 curl_local -fsS http://127.0.0.1:8080/health >/dev/null
 
-for _ in 1 2; do
-  accepted="$(curl_local -sS -o "$response_file" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8080/v1/traces \
-    -H 'content-type: application/json' \
-    -H "x-api-key: $api_key" \
-    -H "x-tenant-id: $tenant" \
-    --data-binary @examples/otlp-traces.json)"
-  test "$accepted" = "200"
-done
+accepted="$(curl_local -sS -o "$response_file" -w '%{http_code}' \
+  -X POST http://127.0.0.1:8080/v1/traces \
+  -H 'content-type: application/json' \
+  -H "x-api-key: $api_key" \
+  -H "x-tenant-id: $tenant" \
+  --data-binary @examples/otlp-traces.json)"
+test "$accepted" = "200"
+
+accepted_gzip="$(curl_local -sS -o "$response_file" -w '%{http_code}' \
+  -X POST http://127.0.0.1:8080/v1/traces \
+  -H 'content-type: application/json' \
+  -H 'content-encoding: gzip' \
+  -H "x-api-key: $api_key" \
+  -H "x-tenant-id: $tenant" \
+  --data-binary @"$gzip_file")"
+test "$accepted_gzip" = "200"
 test "$(cat "$response_file")" = "{}"
 
 for _ in $(seq 1 100); do

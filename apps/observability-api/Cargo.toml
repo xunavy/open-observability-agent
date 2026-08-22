@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 axum = "0.8"
+flate2 = "=1.1.9"
 observability-core = { path = "../../crates/observability-core" }
 observability-sqlite = { path = "../../crates/observability-sqlite" }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }

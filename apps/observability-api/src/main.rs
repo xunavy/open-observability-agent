@@ -293,17 +293,29 @@ async fn ingest_otlp_traces(
         }
     };
 
-    if headers
+    let content_encoding = headers
         .get(axum::http::header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
-    {
-        return otlp_error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            encoding,
-            "compressed OTLP requests are not supported yet",
-        );
-    }
+        .and_then(|value| value.to_str().ok());
+    let decoded_body = match otlp::decode_body(content_encoding, &body, MAX_OTLP_BODY_BYTES) {
+        Ok(body) => body,
+        Err(error @ otlp::OtlpError::UnsupportedContentEncoding(_)) => {
+            return otlp_error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                encoding,
+                error.to_string(),
+            )
+        }
+        Err(otlp::OtlpError::PayloadTooLarge) => {
+            return otlp_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                encoding,
+                "decoded OTLP payload exceeds the 4 MiB limit",
+            )
+        }
+        Err(error) => {
+            return otlp_error_response(StatusCode::BAD_REQUEST, encoding, error.to_string())
+        }
+    };
 
     let tenant_id = match otlp_tenant(&headers) {
         Ok(tenant_id) => tenant_id,
@@ -313,7 +325,7 @@ async fn ingest_otlp_traces(
         return otlp_error_response(status, encoding, message);
     }
 
-    let request = match otlp::decode_request(encoding, &body) {
+    let request = match otlp::decode_request(encoding, &decoded_body) {
         Ok(request) => request,
         Err(error) => {
             return otlp_error_response(StatusCode::BAD_REQUEST, encoding, error.to_string())

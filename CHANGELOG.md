@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-下一阶段聚焦 OTLP metrics/logs、gzip、组织身份与多实例存储。
+下一阶段聚焦 OTLP metrics/logs、组织身份与多实例存储。
+
+## 0.3.1 - 2026-08-23
+
+- 支持 OTLP/HTTP `Content-Encoding: gzip`。
+- 同时执行压缩请求 4 MiB body limit 与解压后 4 MiB limit，限制压缩炸弹。
+- HTTP smoke 同时覆盖 identity 与 gzip exporter 重试去重。
 
 ## 0.3.0 - 2026-08-23
 
@@ -30,6 +36,6 @@
 
 - 组织/项目、OIDC/session、RBAC、tenant key rotation 和审计。
 - 多实例数据库/队列、租户配额、保留策略和容量治理。
-- OTLP metrics/logs、gzip request body 与 gRPC。
+- OTLP metrics/logs 与 gRPC。
 - 支付 provider webhook、订阅同步、退款和税务边界。
 - Cloudflare/Vercel 实际部署、域名与云端 smoke。
