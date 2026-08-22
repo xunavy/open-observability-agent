@@ -10,6 +10,7 @@ services:
     environment:
       OBSERVABILITY_STORAGE: sqlite
       OBSERVABILITY_SQLITE_DATA: /app/data/observability.sqlite
+      OBSERVABILITY_INGEST_MODE: durable
     volumes:
       - observability-data:/app/data
     healthcheck:

@@ -3,6 +3,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps/observability-api ./apps/observability-api
+COPY apps/agent-cli ./apps/agent-cli
 RUN cargo build --release -p observability-api
 
 FROM debian:bookworm-slim

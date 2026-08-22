@@ -6,10 +6,11 @@
 
 项目采用 Apache-2.0 许可证，欢迎通过 GitHub Issue/PR 参与。当前代码是早期开发版本，不应直接接收生产敏感数据。
 
-## 第一阶段边界
+## 当前能力边界
 
-- `observability-core`：租户、Observation、AgentRun 等领域对象与输入校验。
-- 暂不承诺生产级采集、LLM provider、计费或云部署；这些必须在运行验证后再声明。
+- Rust API 支持租户隔离的 Observation、诊断、Agent 计划/安全工具执行、OpenAI-compatible 模型适配、用量账本与月度报价。
+- SQLite 模式支持单实例持久化摄取队列、租约恢复、指数退避、死信查询和租户级重放。
+- 这仍是可运行 MVP：尚未完成多实例数据库/队列、组织 RBAC、支付订阅同步和真实云环境验收，不应直接接收生产敏感数据。
 
 ## 目标架构
 
@@ -47,6 +48,9 @@ POST /v1/model/complete
 POST /v1/usage
 GET  /v1/usage?tenant_id=<uuid>&period=2026-08
 POST /v1/billing/quote
+GET  /v1/ingestion/queue?tenant_id=<uuid>
+GET  /v1/ingestion/dead-letters?tenant_id=<uuid>&limit=100
+POST /v1/ingestion/dead-letters/replay
 ```
 
 ## 启动
@@ -57,19 +61,21 @@ cargo run -p observability-api
 
 服务默认监听 `0.0.0.0:8080`，数据写入 `data/observations.jsonl`。控制台原型位于 `apps/console/index.html`，可部署到静态托管服务后，将 API 地址接入前端。
 
-API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；当前指标为服务存活和存储模式基础指标，业务指标仍在后续接入中。
+API 同时提供 Prometheus 风格的 `GET /metrics`，可由 Prometheus 或 Grafana Cloud 抓取；指标包括服务存活、存储/摄取模式、接收量、模型与 Agent 调用量、队列处理、重试和死信计数。
 
 生产环境请设置 `OBSERVABILITY_API_KEY`，客户端使用 `X-API-Key` 请求头；本地开发可以不设置。
 
 用量账本默认写入 `data/usage.jsonl`，可通过 `OBSERVABILITY_USAGE_DATA` 指定路径；API 启动时会恢复已有账本。
 
-单实例 SQLite 模式：设置 `OBSERVABILITY_STORAGE=sqlite`，数据库默认写入 `data/observability.sqlite`，也可通过 `OBSERVABILITY_SQLITE_DATA` 配置。
+单实例 SQLite 模式：设置 `OBSERVABILITY_STORAGE=sqlite`，数据库默认写入 `data/observability.sqlite`，也可通过 `OBSERVABILITY_SQLITE_DATA` 配置。再设置 `OBSERVABILITY_INGEST_MODE=durable` 后，单条和批量摄取先原子写入队列并返回 `202 Accepted`，后台 worker 再写入 observation store；默认 `direct` 模式保持同步写入并返回 `201 Created`。
 
-生产部署建议设置 `OBSERVABILITY_ENV=production`、`OBSERVABILITY_API_KEY` 和 `OBSERVABILITY_CORS_ORIGINS`（逗号分隔的前端来源）。当前 API key 是原型级全局密钥，正式 SaaS 仍需接入组织、项目、RBAC、密钥轮换和审计日志。
+持久队列可通过 `OBSERVABILITY_QUEUE_MAX_ATTEMPTS`、`OBSERVABILITY_QUEUE_POLL_MS` 和 `OBSERVABILITY_QUEUE_LEASE_MS` 调整。死信接口始终执行 tenant 校验；队列未启用时返回 `409 Conflict`。
+
+生产部署建议设置 `OBSERVABILITY_ENV=production`、认证密钥和 `OBSERVABILITY_CORS_ORIGINS`（逗号分隔的前端来源）。认证可以使用全局 `OBSERVABILITY_API_KEY`，也可以使用 `OBSERVABILITY_API_KEYS=tenant_uuid=secret,...`；生产模式两者都未配置时，除公开 `/health` 外的请求返回 `500`。当前密钥配置仍是原型级能力，正式 SaaS 需要持久化组织、项目、RBAC、轮换和审计日志。
 
 单租户部署可额外设置 `OBSERVABILITY_TENANT_ID=<uuid>`；所有 observation、Agent、model、usage 和 billing 请求的 tenant_id 不匹配时都会返回 `403`。多租户 SaaS 仍需将此配置替换为持久化的 tenant-scoped key/RBAC。
 
-容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查和 workspace 测试。
+容器和云部署边界见 [docs/deployment.md](docs/deployment.md)。GitHub Actions 会执行格式检查、workspace 测试和持久队列重启 smoke。
 
 本地容器启动：复制 `.env.example` 为 `.env` 后运行 `docker compose up --build`；API 使用 SQLite volume 持久化并提供 `/health` 健康检查。
 
@@ -86,3 +92,7 @@ SQLite backend 位于 `crates/observability-sqlite`，当前用于单实例验�
 在 Linux/WSL 中可运行 `bash ./scripts/smoke-api.sh` 验证实际 HTTP 启动链路。
 
 可运行 `bash ./scripts/smoke-usage-persistence.sh` 验证服务重启后 usage 账本仍可恢复。
+
+可运行 `bash ./scripts/smoke-durable-queue.sh` 验证 observation 在 worker 消费前写入 SQLite、API 重启后仍能被消费，并最终从队列移除。
+
+可运行 `bash ./scripts/smoke-tenant-auth.sh` 验证生产 tenant key、公开健康检查和跨租户拒绝链路。

@@ -59,6 +59,61 @@ pub trait ObservationRepository: Send + Sync {
     fn list(&self) -> Result<Vec<Observation>, ObservationError>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationQueueItem {
+    pub id: Uuid,
+    pub observation: Observation,
+    pub attempts: u32,
+    pub available_at_ms: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObservationQueueStats {
+    pub pending: u64,
+    pub processing: u64,
+    pub dead_letter: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QueueDisposition {
+    Pending,
+    DeadLetter,
+}
+
+pub trait ObservationQueueRepository: Send + Sync {
+    fn enqueue_batch(
+        &self,
+        observations: &[Observation],
+        now_ms: i64,
+    ) -> Result<usize, ObservationError>;
+    fn claim_next(
+        &self,
+        now_ms: i64,
+        lease_until_ms: i64,
+    ) -> Result<Option<ObservationQueueItem>, ObservationError>;
+    fn complete(&self, id: &Uuid) -> Result<(), ObservationError>;
+    fn fail(
+        &self,
+        id: &Uuid,
+        error: &str,
+        retry_at_ms: i64,
+        max_attempts: u32,
+    ) -> Result<QueueDisposition, ObservationError>;
+    fn stats(&self, tenant_id: &TenantId) -> Result<ObservationQueueStats, ObservationError>;
+    fn dead_letters(
+        &self,
+        tenant_id: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<ObservationQueueItem>, ObservationError>;
+    fn requeue_dead_letter(
+        &self,
+        tenant_id: &TenantId,
+        id: &Uuid,
+        now_ms: i64,
+    ) -> Result<bool, ObservationError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct BoundedObservationQueue {
     capacity: usize,
