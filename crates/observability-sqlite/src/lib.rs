@@ -473,8 +473,18 @@ mod tests {
             attributes: BTreeMap::new(),
         };
 
-        assert_eq!(store.enqueue_batch(&[observation.clone()], 100).unwrap(), 1);
-        assert_eq!(store.enqueue_batch(&[observation.clone()], 100).unwrap(), 0);
+        assert_eq!(
+            store
+                .enqueue_batch(std::slice::from_ref(&observation), 100)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .enqueue_batch(std::slice::from_ref(&observation), 100)
+                .unwrap(),
+            0
+        );
         assert_eq!(store.stats(&tenant).unwrap().pending, 1);
 
         let first = store.claim_next(100, 200).unwrap().unwrap();

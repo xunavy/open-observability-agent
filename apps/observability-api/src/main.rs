@@ -852,8 +852,12 @@ mod tests {
         let store = Arc::new(SqliteStore::open(":memory:").unwrap());
         let tenant = Uuid::new_v4();
         let observation = observation(tenant, 1, ObservationStatus::Ok);
-        ObservationQueueRepository::enqueue_batch(store.as_ref(), &[observation.clone()], 100)
-            .unwrap();
+        ObservationQueueRepository::enqueue_batch(
+            store.as_ref(),
+            std::slice::from_ref(&observation),
+            100,
+        )
+        .unwrap();
         let queue_repository: Arc<dyn ObservationQueueRepository> = store.clone();
         let observation_repository: Arc<dyn ObservationRepository> = store.clone();
         let usage_repository: Arc<dyn UsageRepository> = store.clone();

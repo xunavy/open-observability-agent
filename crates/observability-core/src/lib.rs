@@ -677,7 +677,7 @@ mod tests {
             objective: "解释执行失败".into(),
             observation_ids: vec![observation.id],
         };
-        let decision = plan_agent_request(&request, &[observation.clone()]);
+        let decision = plan_agent_request(&request, std::slice::from_ref(&observation));
         assert_eq!(decision.evidence_ids, vec![observation.id]);
         assert_eq!(decision.actions[0].tool_name, "summarize_trace");
     }
